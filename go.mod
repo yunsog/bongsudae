@@ -1,4 +1,4 @@
-module bongsudae
+module github.com/yunsog/bongsudae
 
 go 1.26.8
 

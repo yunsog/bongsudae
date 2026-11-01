@@ -49,11 +49,19 @@ relying on it.
 - **Dependencies** : Go standard library and [franz-go](https://github.com/twmb/franz-go)
   (Kafka client).
 
-## Build
+## Install
 
 Go 1.26 or later.
 
 ```
+go install github.com/yunsog/bongsudae@latest     # binary in $(go env GOPATH)/bin/bongsudae
+```
+
+or from a clone :
+
+```
+git clone https://github.com/yunsog/bongsudae.git
+cd bongsudae
 go build -o bongsudae .
 go test ./...
 ```

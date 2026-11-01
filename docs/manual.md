@@ -59,8 +59,9 @@ The example below uses the working directory `/var/lib/bongsudae`, the binary `/
 Example files are in `deploy/` (`bongsudae.conf.example`, `bongsudae.service.example`).
 
 ```bash
-# 1) Build (Go 1.26 or later; no network needed, dependencies are in vendor/)
-go build -o bongsudae . && go test .
+# 1) Build (Go 1.26 or later; go downloads the one dependency, franz-go, checked by go.sum)
+go install github.com/yunsog/bongsudae@latest      # -> $(go env GOPATH)/bin/bongsudae
+#    or in a clone : go build -o bongsudae . && go test ./...
 sudo install -m 755 bongsudae /usr/local/bin/bongsudae
 
 # 2) User and working directory
