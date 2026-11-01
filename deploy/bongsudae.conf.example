@@ -1,0 +1,45 @@
+# /etc/bongsudae/bongsudae.conf : Bongsudae configuration (example, every key with its default unless noted)
+#
+# Format : "key = value" under a [section]. Everything after # is a comment.
+# Lists are comma separated; a value ending in a comma continues on the next line.
+# A missing key = default. Command line options win over this file.
+# Unknown key / duplicate key / invalid value = Bongsudae refuses to start (a typo must not empty an allow list).
+# Read by : bongsudae -c <file>, otherwise this file (/etc/bongsudae/bongsudae.conf) if it exists.
+#   Only the collector (-input tcp) and the API client commands (-status etc. : token file location) read it.
+#   Test inputs (-input kafka / file) never read it, so production values cannot leak into a test run.
+# After a change : bongsudae -t (check) -> sudo systemctl reload bongsudae
+#   Keys marked (reload) change at once. Keys marked (restart) keep their current value on reload (with a warning)
+#   and need sudo systemctl restart bongsudae (routers reconnect and send their full tables again).
+#   If the file is invalid or missing on reload, nothing changes and Bongsudae keeps running with the current values.
+
+
+[paths]
+rules = /var/lib/bongsudae/conf/kafka_rules.json   # Kafka forwarding rules, written on API changes (restart)  option -rules
+                                                   #   default conf/kafka_rules.json (relative to the working directory)
+                                                   #   content is read again on every reload; missing at start = default rule only
+token = /var/lib/bongsudae/conf/api_token          # key file for the changing API calls, mode 600 (restart)   option -token
+                                                   #   content is read on every request
+lock  = /var/lib/bongsudae/run/bongsudae.lock      # lock file : a second copy exits at once (restart)          option -lock
+                                                   #   default empty = no lock
+
+
+[bmp]
+listen = :5000                       # address for BMP sessions from routers (restart)              option -listen
+allow  = 127.0.0.1, ::1              # routers allowed to connect : addresses / prefixes (reload)   option -allow
+                                     #   e.g. 192.0.2.0/24, 2001:db8::/64 (router loopbacks)
+                                     #   on reload, current sessions from routers no longer allowed are closed
+raw    = true                        # forward every received BMP message to openbmp.bmp_raw (reload)  option -raw
+chash  =                             # C_HASH_ID in message headers, 32 hex digits (restart)        option -chash
+                                     #   empty = md5(host name). Also used in router hashes : keep it stable
+
+
+[kafka]
+brokers = 127.0.0.1:9092             # Kafka bootstrap servers (restart)                            option -kafka
+prefix  = openbmp.parsed             # topic prefix : <prefix>.unicast_prefix / .peer / .router (restart)  option -prefix
+
+
+[http]
+listen =                             # HTTP API address, empty = off (restart)                      option -http
+                                     #   e.g. 127.0.0.1:5001 (local only) or :5001
+allow  =                             # clients allowed to use the API, others get 403 (reload)      option -http-allow
+                                     #   empty = everyone who can connect. e.g. 127.0.0.1, ::1, 198.51.100.0/24

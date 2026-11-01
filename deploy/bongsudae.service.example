@@ -1,0 +1,47 @@
+# /etc/systemd/system/bongsudae.service : Bongsudae BMP collector (example)
+#
+# Install (see docs/manual.md) :
+#   sudo useradd -r -s /usr/sbin/nologin -d /var/lib/bongsudae bongsudae
+#   sudo install -m 755 bongsudae /usr/local/bin/bongsudae
+#   sudo install -d -m 755 /etc/bongsudae
+#   sudo install -m 644 deploy/bongsudae.conf.example /etc/bongsudae/bongsudae.conf   (then edit allow, http ...)
+#   sudo install -m 644 deploy/bongsudae.service.example /etc/systemd/system/bongsudae.service
+#   sudo systemctl daemon-reload && sudo systemctl enable --now bongsudae
+#
+# Commands : systemctl status bongsudae
+#            sudo systemctl reload bongsudae    (read the configuration and rules files again, not a restart)
+#            sudo systemctl restart bongsudae   (new release : routers reconnect and send their full tables again)
+#            journalctl -u bongsudae            (log : one "stat ..." line per minute)
+#
+# If Kafka cannot be reached for 2 minutes Bongsudae exits on purpose; systemd starts it again.
+[Unit]
+Description=Bongsudae BMP collector
+After=network-online.target kafka.service
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+User=bongsudae
+Group=bongsudae
+# /var/lib/bongsudae : working directory (conf/kafka_rules.json, conf/api_token, run/bongsudae.lock)
+StateDirectory=bongsudae
+WorkingDirectory=/var/lib/bongsudae
+ExecStartPre=/bin/mkdir -p /var/lib/bongsudae/conf /var/lib/bongsudae/run
+ExecStart=/usr/local/bin/bongsudae
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=10
+# SIGTERM : messages still in the buffer are sent to Kafka before exit
+TimeoutStopSec=60
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/var/lib/bongsudae
+# The routing tables live in memory : about 65 bytes per route (a full table of ~1M routes per peer is about 80 MB),
+# plus Go GC headroom. Size this for your number of full-table peers.
+MemoryMax=30G
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
