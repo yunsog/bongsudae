@@ -74,17 +74,17 @@ func (c *collector) auth(h http.HandlerFunc) http.HandlerFunc {
 		b, err := os.ReadFile(c.tokenPath)
 		tok := strings.TrimSpace(string(b))
 		if err != nil || len(tok) < 16 {
-			httpErr(w, 403, "변경 API 꺼짐 : key 파일 %s 없음 (16 글자 이상)", c.tokenPath)
+			httpErr(w, 403, "changes disabled : key file %s missing or shorter than 16 characters", c.tokenPath)
 			return
 		}
 		if !validActor(req.Header.Get("X-Actor")) {
-			httpErr(w, 400, "X-Actor : 출력 가능한 ASCII (공백 제외) 1 ~ 64 글자")
+			httpErr(w, 400, "X-Actor : 1 to 64 printable ASCII characters, no spaces")
 			return
 		}
 		got := strings.TrimSpace(req.Header.Get("X-API-Key"))
 		if subtle.ConstantTimeCompare([]byte(got), []byte(tok)) != 1 {
-			log.Printf("rules: key 틀림 %s %s from %s%s", req.Method, req.URL.Path, req.RemoteAddr, actor(req))
-			httpErr(w, 403, "key 틀림")
+			log.Printf("rules: wrong key %s %s from %s%s", req.Method, req.URL.Path, req.RemoteAddr, actor(req))
+			httpErr(w, 403, "wrong key")
 			return
 		}
 		h(w, req)
@@ -136,12 +136,12 @@ func (c *collector) apiRules(w http.ResponseWriter, req *http.Request) {
 func ruleTarget(req *http.Request) (router, peer string, err error) {
 	if s := req.PathValue("ip"); s != "" {
 		if router, err = normIP(s); err != nil {
-			return "", "", errors.New("router " + s + " : 주소가 아님")
+			return "", "", errors.New("router " + s + " : not an address")
 		}
 	}
 	if s := req.PathValue("peer"); s != "" {
 		if peer, err = normIP(s); err != nil {
-			return "", "", errors.New("peer " + s + " : 주소가 아님")
+			return "", "", errors.New("peer " + s + " : not an address")
 		}
 	}
 	return
@@ -199,11 +199,11 @@ func (c *collector) apiRulePut(w http.ResponseWriter, req *http.Request) {
 	d := json.NewDecoder(io.LimitReader(req.Body, 64<<10))
 	d.DisallowUnknownFields()
 	if err := d.Decode(&body); err != nil {
-		httpErr(w, 400, "본문 : %v (모양 {\"topics\": [...]})", err)
+		httpErr(w, 400, "body : %v (expected {\"topics\": [...]})", err)
 		return
 	}
 	if body.Topics == nil {
-		httpErr(w, 400, `"topics" 없음 (보내지 않으려면 "topics": [])`)
+		httpErr(w, 400, `"topics" missing (use "topics": [] to send nothing)`)
 		return
 	}
 	topics, err := checkTopics(*body.Topics)
@@ -212,7 +212,7 @@ func (c *collector) apiRulePut(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	if err := c.rules.ensureAll(topics); err != nil {
-		httpErr(w, 500, "토픽 만들기 : %v", err)
+		httpErr(w, 500, "create topic : %v", err)
 		return
 	}
 	err = c.rules.change(func(s *ruleSet) error {
@@ -241,7 +241,7 @@ func (c *collector) apiRuleDel(w http.ResponseWriter, req *http.Request) {
 		httpErr(w, 400, "%v", err)
 		return
 	}
-	errNone := errors.New("규칙 없음 (이미 위 단계를 따름)")
+	errNone := errors.New("no such rule (already follows the level above)")
 	err = c.rules.change(func(s *ruleSet) error {
 		rr := s.Routers[router]
 		if peer == "" {
@@ -294,7 +294,7 @@ func (c *collector) ruleDone(w http.ResponseWriter, req *http.Request, router, p
 func (c *collector) apiRuleReload(w http.ResponseWriter, req *http.Request) {
 	changes, err := c.rules.reloadLog("api " + req.RemoteAddr + actor(req))
 	if err != nil {
-		httpErr(w, 400, "%v (이전 규칙 그대로)", err)
+		httpErr(w, 400, "%v (previous rules kept)", err)
 		return
 	}
 	if changes == nil {

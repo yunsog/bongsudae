@@ -30,12 +30,15 @@ type router struct {
 	mu         sync.RWMutex // 아래 모든 것 (ip, hash 는 만든 뒤 안 바뀜)
 	ip         string
 	hash       string
-	peers      map[string]*peer // peer hash -> peer (down 도 남음)
+	peers      map[string]*peer // peer hash -> peer (down 도 남음, API 가 씀)
+	byID       map[peerID]*peer // 주소 + RD -> 같은 peer (메시지마다 찾기, rib.go peerGet)
 	routerSeq  uint32           // router 메시지 번호 (연결마다 0 부터)
 	peerSeq    uint32           // peer 메시지 번호 (연결마다 0 부터)
 	terminated bool             // term 을 이미 냄
 	connGen    uint64           // TCP 연결 번호 : 늦게 처리된 이전 연결의 끊김을 무시하려고
 	stat       stats            // 1 분 통계 (logStat 이 모아서 0 으로)
+	sink       rowSink          // unicast_prefix 줄 버퍼 (UPDATE 마다 다시 씀, row.go)
+	enc        rowEnc
 
 	// 현황 (웹 API)
 	sysName, sysDescr string                   // Initiation
@@ -60,8 +63,14 @@ func (r *router) reset(t time.Time) {
 
 // collector : 전체 상태 + 통계
 type collector struct {
-	mu      sync.RWMutex  // routers 목록 (라우터 안은 r.mu)
-	cHash   string        // C_HASH_ID (collector 해시, openbmpd 설정 값 그대로)
+	mu    sync.RWMutex // routers 목록 (라우터 안은 r.mu)
+	cHash string       // C_HASH_ID (collector 해시, openbmpd 설정 값 그대로)
+	// keyBuckets : unicast_prefix 메시지를 프리픽스 칸으로 나눔 (Kafka key 1-B, -key-buckets). 0 = 나누지 않음 (key = peer hash)
+	keyBuckets int
+	// noRIB : 경로표를 들지 않음 (-rib=false, 0.2.0). 줄 / Kafka 는 같고, 경로 수 / 프리픽스 찾기 API 만 못 씀 (메모리 대비)
+	noRIB bool
+	// json : Kafka 메시지를 JSON 으로 (-format json, 0.2.0, jsonrow.go). false = openbmp v1.7 (기본)
+	json    bool
 	seq     atomic.Uint64 // 줄 번호 (줄마다 1 씩, 여러 goroutine 이 함께 씀)
 	routers map[string]*router
 
@@ -107,7 +116,7 @@ func (c *collector) routerFor(ip, hash string) *router {
 		if hash == "" {
 			hash = md5hex(ip, c.cHash)
 		}
-		r = &router{ip: ip, hash: hash, peers: map[string]*peer{}}
+		r = &router{ip: ip, hash: hash, peers: map[string]*peer{}, byID: map[peerID]*peer{}}
 		c.routers[ip] = r
 	}
 	return r
@@ -145,18 +154,19 @@ func (c *collector) process(r *router, msg []byte, now time.Time) ([]outMsg, err
 		return c.initiation(r, body, now), nil
 	case bmpTerm:
 		return c.termination(r, body, now), nil
+	case bmpStats: // peer 상세 API 에만 (Kafka 출력 없음, bmp_stats.go)
+		return nil, c.statsReport(r, body, now)
 	}
-	return nil, nil // Stats, Mirror : 출력 없음
+	return nil, nil // Route Mirroring : 출력 없음
 }
 
-// peerInfo : per-peer 머리로 peer hash 와 줄 공통 정보
-func (c *collector) peerInfo(r *router, h *peerHdr, now time.Time) rowPeer {
-	ip := h.addr.String()
+// peerInfo : 줄 공통 정보 (peer hash 와 주소 글자는 peer 에 이미 있음)
+func (c *collector) peerInfo(r *router, p *peer, h *peerHdr, now time.Time) rowPeer {
 	return rowPeer{
 		routerHash: r.hash,
 		routerIP:   r.ip,
-		peerHash:   md5hex(ip, rdString(h.rd), r.hash),
-		peerIP:     ip,
+		peerHash:   p.key,
+		peerIP:     p.ipStr,
 		peerAS:     h.as,
 		ts:         tsString(h.sec, h.usec, now),
 		prePolicy:  h.flags&flagL == 0,
@@ -177,8 +187,8 @@ func (c *collector) routeMon(r *router, b []byte, now time.Time) ([]outMsg, erro
 	if typ != 2 {
 		return nil, fmt.Errorf("route_mon bgp type %d", typ)
 	}
-	rp := c.peerInfo(r, &h, now)
 	p := r.peerGet(&h)
+	rp := c.peerInfo(r, p, &h, now)
 	if !p.up {
 		// Peer Up 없이 경로가 옴 (그림자 실행 / 그 전에 맺어진 세션) : up 으로 보되 경로 수는 부정확
 		p.up, p.gotUp, p.since, p.downReason = true, false, now, ""
@@ -190,7 +200,11 @@ func (c *collector) routeMon(r *router, b []byte, now time.Time) ([]outMsg, erro
 		return nil, err
 	}
 	r.stat.others += u.others
-	p.apply(u, now)
+	if c.noRIB {
+		p.countOnly(u, now)
+	} else {
+		p.apply(u, now)
+	}
 	p.gotEoR(u, now)
 	return c.updateMsgs(r, &rp, u), nil
 }
@@ -207,33 +221,32 @@ func (c *collector) updateMsgs(r *router, rp *rowPeer, u *update) []outMsg {
 		r.stat.dropped += nAdd + nDel // 규칙 = 보내지 않음 : 줄을 만들지 않음
 		return nil
 	}
+	// 줄 번호는 칸과 상관없이 원래 줄 순서대로 (칸을 나눠도 seq 는 나누지 않을 때와 같음)
 	var out []outMsg
-	var sb strings.Builder
+	s, e := &r.sink, &r.enc // 라우터마다 다시 쓰는 버퍼 (r.mu 안)
+	s.reset(c.keyBuckets)
+	e.reset(false, c.json, rp, &u.attrs)
 	for _, p := range u.v4Add {
 		seq++
-		addRow(&sb, seq, rp, &u.attrs, p, true)
+		s.add(e, seq, p, true)
 	}
 	for _, p := range u.v6Add {
 		seq++
-		addRow(&sb, seq, rp, &u.attrs, p, false)
+		s.add(e, seq, p, false)
 	}
-	if nAdd > 0 {
-		out = append(out, makeMsg(c.cHash, kindPrefix, rp.peerHash, sb.String(), nAdd))
-		out[len(out)-1].topics = topics
-	}
-	sb.Reset()
+	out = s.msgs(out, c, rp.peerHash, topics)
+	s.reset(c.keyBuckets)
+	e.reset(true, c.json, rp, nil)
 	for _, p := range u.v4Del {
 		seq++
-		delRow(&sb, seq, rp, p, true)
+		s.add(e, seq, p, true)
 	}
 	for _, p := range u.v6Del {
 		seq++
-		delRow(&sb, seq, rp, p, false)
+		s.add(e, seq, p, false)
 	}
-	if nDel > 0 {
-		out = append(out, makeMsg(c.cHash, kindPrefix, rp.peerHash, sb.String(), nDel))
-		out[len(out)-1].topics = topics
-	}
+	out = s.msgs(out, c, rp.peerHash, topics)
+	e.reset(false, false, nil, nil) // UPDATE 를 붙잡고 있지 않게
 	return out
 }
 
@@ -355,6 +368,16 @@ func (c *collector) handle(ip, hash string, msg []byte, now time.Time) []outMsg 
 	return c.safeProcess(r, msg, now)
 }
 
+// handleConn : tcp 입력의 메시지 하나. gen 이 지금 연결 번호가 아니면 (새 연결이 이어 받음) 처리하지 않고 false
+func (c *collector) handleConn(ip string, gen uint64, msg []byte, now time.Time) ([]outMsg, bool) {
+	r := c.lockRouter(ip, "")
+	defer r.mu.Unlock()
+	if gen != r.connGen {
+		return nil, false
+	}
+	return c.safeProcess(r, msg, now), true
+}
+
 // connStart : TCP 새 연결 (첫 메시지 = Initiation 직전). 돌려주는 것 = 연결 번호 (connClosed 에 다시 줌)
 func (c *collector) connStart(ip string, now time.Time) uint64 {
 	r := c.lockRouter(ip, "")
@@ -432,15 +455,19 @@ func (c *collector) logStat(p *producer) {
 	c.stat = stats{}
 	c.statMu.Unlock()
 	rs := c.sortedRouters()
+	m.ByRouter = map[string]map[string]int{}
 	for _, r := range rs {
 		r.mu.Lock()
 		total.addAll(&r.stat)
+		if r.stat.msgs > 0 || r.stat.errors > 0 || r.stat.bmpTotal() > 0 {
+			m.ByRouter[r.ip] = r.stat.counts()
+		}
 		r.stat = stats{}
 		r.mu.Unlock()
 	}
 	log.Printf("stat routers=%d %s%s kafka_fail=%d%s", len(rs), total.String(), raw, fails, topics)
 	m.Routers, m.Counts = len(rs), total.counts()
-	hist.add(m, p) // GET /api/stats (stats_api.go)
+	hist.add(m, &total, p) // GET /api/stats (stats_api.go), /metrics (metrics.go)
 }
 
 // statErr : 라우터를 모르는 오류 하나 (Kafka bmp_raw 머리가 깨짐 등)

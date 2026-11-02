@@ -1,11 +1,14 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
 	"testing"
 	"time"
+
+	"github.com/twmb/franz-go/pkg/kgo"
 )
 
 // TestRules : 단계 (peer -> router -> default), [] 와 지움의 차이, 파일 쓰기 / 손으로 고침 / reload
@@ -147,5 +150,25 @@ func TestEoR(t *testing.T) {
 	p.markDown(now, "test")
 	if p.synced() || !p.eorV4.IsZero() {
 		t.Fatal("down keeps sync")
+	}
+}
+
+// key 나누기의 partition (0.2.0) : 나누지 않은 key 는 Kafka 기본 (franz-go StickyKeyPartitioner = murmur2) 과 같고,
+// 한 peer 의 칸 8 개는 partition 8 개에 하나씩
+func TestBucketPartition(t *testing.T) {
+	std := kgo.StickyKeyPartitioner(nil).ForTopic("t")
+	for i := 0; i < 1000; i++ {
+		k := []byte(md5hex(fmt.Sprint(i)))
+		r := &kgo.Record{Key: k}
+		if got, want := bucketPartition(r, 8), std.Partition(r, 8); got != want {
+			t.Fatalf("key %s : %d, kafka default %d", k, got, want)
+		}
+		seen := map[int]bool{}
+		for b := 0; b < 8; b++ {
+			seen[bucketPartition(&kgo.Record{Key: []byte(fmt.Sprintf("%s.%d", k, b))}, 8)] = true
+		}
+		if len(seen) != 8 {
+			t.Fatalf("peer %s : buckets on %d partitions", k, len(seen))
+		}
 	}
 }

@@ -7,10 +7,12 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"log"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -34,6 +36,9 @@ type producer struct {
 	rawTopic string       // 받은 BMP 를 그대로 내보낼 토픽 (빈칸 = 만든 적 없음). tcp 입력만 (enableRaw)
 	rawOn    atomic.Bool  // 지금 내보내는지 (설정 bmp.raw, reload 로 켜고 끔)
 	rawN     atomic.Int64 // 지난 1 분에 보낸 bmp_raw 수
+
+	regoneMu sync.Mutex
+	regoneAt map[string]time.Time // 토픽을 다시 읽은 시각 (topicGone, 30 초에 한 번)
 }
 
 const (
@@ -66,21 +71,27 @@ func (e *errLog) flush() {
 	defer e.mu.Unlock()
 	for msg, n := range e.count {
 		if n > 1 {
-			log.Printf("%s : %d 번 (지난 1 분)", msg, n)
+			log.Printf("%s : %d times (last minute)", msg, n)
 		}
 	}
 	e.count = map[string]int{}
 }
 
 func newProducer(broker, prefix string) (*producer, error) {
-	cl, err := kgo.NewClient(
+	opts := []kgo.Opt{
 		kgo.SeedBrokers(broker),
-		kgo.ProducerLinger(20*time.Millisecond),
+		kgo.ProducerLinger(20 * time.Millisecond),
 		kgo.MaxBufferedRecords(maxBuffered),
 		kgo.ProducerBatchCompression(kgo.NoCompression()), // 소비자 (Python) 가 압축 라이브러리 없이 읽도록
 		kgo.RecordRetries(10),
-		kgo.ProducerBatchMaxBytes(4<<20), // bmp_raw 하나가 BMP 최대 1 MB + 머리 (기본 1 MB 를 넘을 수 있음)
-	)
+		kgo.ProducerBatchMaxBytes(4 << 20), // bmp_raw 하나가 BMP 최대 1 MB + 머리 (기본 1 MB 를 넘을 수 있음)
+	}
+	if *optBucket > 0 { // key 나누기 : partition 을 직접 고름 (bucketPartition). 0 이면 Kafka 기본 그대로
+		opts = append(opts, kgo.RecordPartitioner(kgo.BasicConsistentPartitioner(func(string) func(*kgo.Record, int) int {
+			return bucketPartition
+		})))
+	}
+	cl, err := kgo.NewClient(opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -122,16 +133,39 @@ func (p *producer) enableRaw(prefix string) error {
 	return nil
 }
 
-// sendRaw : BMP 메시지 하나를 그대로 (켜져 있을 때만)
-func (p *producer) sendRaw(cHash, rHash, ip string, msg []byte) {
+// rawHead : 연결 하나의 bmp_raw 머리 "V: 1.7\nC_HASH_ID: ..\nR_HASH: ..\nR_IP: ..\nL: <길이>\n\n" 중 길이 앞까지 (0.2.0)
+type rawHead struct {
+	prefix string
+	key    []byte // Kafka key = router hash (레코드마다 같은 바이트, 읽기만)
+	room   int    // 머리가 들어갈 자리 = prefix + 길이 7 자리 (메시지 최대 1 MB) + "\n\n"
+}
+
+func newRawHead(cHash, rHash, ip string) *rawHead {
+	pre := "V: 1.7\nC_HASH_ID: " + cHash + "\nR_HASH: " + rHash + "\nR_IP: " + ip + "\nL: "
+	return &rawHead{prefix: pre, key: []byte(rHash), room: len(pre) + 7 + 2}
+}
+
+// sendRaw : BMP 메시지 하나를 그대로 (켜져 있을 때만). full = 앞 h.room 바이트가 빈 메시지 (msgReader.full) :
+// 머리를 메시지 바로 앞에 써 넣어 복사 없이 보냄 (전에는 머리 + 메시지를 새로 할당해 복사)
+func (p *producer) sendRaw(h *rawHead, full []byte) {
 	if !p.rawOn.Load() {
 		return
 	}
-	head := fmt.Sprintf("V: 1.7\nC_HASH_ID: %s\nR_HASH: %s\nR_IP: %s\nL: %d\n\n", cHash, rHash, ip, len(msg))
-	v := make([]byte, 0, len(head)+len(msg))
-	v = append(append(v, head...), msg...)
-	p.produceRec(&kgo.Record{Topic: p.rawTopic, Key: []byte(rHash), Value: v})
+	p.produceRec(&kgo.Record{Topic: p.rawTopic, Key: h.key, Value: h.value(full)})
 	p.rawN.Add(1)
+}
+
+// value : 머리를 메시지 바로 앞에 써 넣고 머리 + 메시지 slice 를 돌려줌
+func (h *rawHead) value(full []byte) []byte {
+	msg := full[h.room:]
+	var tmp [192]byte // 머리 (보통 150 바이트 안팎) : 넘으면 append 가 늘림
+	head := append(append(append(tmp[:0], h.prefix...), strconv.Itoa(len(msg))...), '\n', '\n')
+	start := h.room - len(head)
+	if start < 0 { // 길이 자리가 모자람 (메시지 최대 1 MB 라 없어야 함) : 예전처럼 새로 할당해 복사
+		return append(append(make([]byte, 0, len(head)+len(msg)), head...), msg...)
+	}
+	copy(full[start:], head)
+	return full[start:]
 }
 
 // dead : 보내기가 kafkaDeadAfter 넘게 하나도 성공하지 못했고, 그동안 실패했거나 보낼 것이 쌓여 있음
@@ -144,12 +178,13 @@ func (p *producer) dead() bool {
 	return p.lastFail.Load() > p.lastOK.Load() || p.cl.BufferedProduceRecords() > 0
 }
 
-// ensureTopic : 토픽이 없으면 만듦 (partition 8, 보관 90 분 = 운영 토픽과 같게)
+// ensureTopic : 토픽이 없으면 만듦. partition / replication / 보관 시간 = 옵션 -partitions / -replication / -retention
+// (설정 kafka.partitions / replication / retention, 기본 8 / 1 / 90 분 = 우리 운영 토픽과 같게). 이미 있는 토픽은 건드리지 않음
 func ensureTopic(cl *kgo.Client, topic string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	retention := "5400000"
-	r, err := kadm.NewClient(cl).CreateTopic(ctx, 8, 1, map[string]*string{"retention.ms": &retention}, topic)
+	retention := strconv.FormatInt(optRetention.Milliseconds(), 10)
+	r, err := kadm.NewClient(cl).CreateTopic(ctx, int32(*optParts), int16(*optRepl), map[string]*string{"retention.ms": &retention}, topic)
 	if err == nil {
 		err = r.Err
 	}
@@ -190,7 +225,38 @@ func (p *producer) produceRec(rec *kgo.Record) {
 		p.fails.Add(1)
 		p.lastFail.Store(now)
 		kafkaErrs.add(fmt.Sprintf("kafka produce %s: %v", r.Topic, err))
+		if topicGone(err) {
+			p.retopic(r.Topic)
+		}
 	})
+}
+
+// topicGone : 토픽이 지워졌거나 다시 만들어져 (새 토픽 ID) 클라이언트가 가진 정보가 틀렸다는 오류
+// (10-29 KRaft 전환 때 겪음 : franz-go 는 옛 ID 를 계속 써서 2 분 뒤 끝내고 systemd 재시작으로만 회복했음)
+func topicGone(err error) bool {
+	return errors.Is(err, kerr.UnknownTopicID) || errors.Is(err, kerr.UnknownTopicOrPartition)
+}
+
+// retopic : 그 토픽의 정보를 버리고 (버퍼의 그 토픽 레코드도 실패로) 다시 읽음, 없으면 만듦. 토픽마다 30 초에 한 번 (0.2.0)
+// 바로 다음 레코드부터 새 토픽 ID 로 감 = 재시작 (RIB 다시 받기) 없이 회복
+func (p *producer) retopic(topic string) {
+	p.regoneMu.Lock()
+	if p.regoneAt == nil {
+		p.regoneAt = map[string]time.Time{}
+	}
+	if time.Since(p.regoneAt[topic]) < 30*time.Second {
+		p.regoneMu.Unlock()
+		return
+	}
+	p.regoneAt[topic] = time.Now()
+	p.regoneMu.Unlock()
+	go func() { // callback 안에서 막히지 않게 따로
+		log.Printf("kafka topic %s : unknown topic (deleted / re-created?), re-reading topic metadata", topic)
+		p.cl.PurgeTopicsFromProducing(topic)
+		if err := ensureTopic(p.cl, topic); err != nil {
+			log.Printf("kafka topic %s : %v", topic, err)
+		}
+	}()
 }
 
 // close : 남은 것을 다 보내고 닫음 (여러 번 불러도 한 번만)
@@ -261,6 +327,7 @@ func runKafka(ctx context.Context, broker, src, group string, c *collector, out 
 	w := &rawWorkers{c: c, out: out, ch: map[string]chan rawJob{}}
 	tick := time.Now()
 	var badSince time.Time // 읽기 오류만 오기 시작한 시각 (레코드를 받으면 0 으로)
+	var regone time.Time   // 읽는 토픽을 다시 읽은 시각 (토픽이 다시 만들어짐, 30 초에 한 번)
 	for {
 		fetches := cl.PollFetches(ctx)
 		if ctx.Err() != nil {
@@ -271,10 +338,18 @@ func runKafka(ctx context.Context, broker, src, group string, c *collector, out 
 			return nil
 		}
 		nerr := 0
+		gone := false
 		fetches.EachError(func(t string, p int32, err error) {
 			nerr++
 			kafkaErrs.add(fmt.Sprintf("fetch %s: %v", t, err)) // partition 은 빼고 : 같은 오류 = 한 종류
+			gone = gone || topicGone(err)
 		})
+		if gone && time.Since(regone) > 30*time.Second { // 토픽이 다시 만들어짐 : 버리고 다시 읽기 (0.2.0)
+			regone = time.Now()
+			log.Printf("kafka topic %s : unknown topic (deleted / re-created?), re-subscribing", src)
+			cl.PurgeTopicsFromConsuming(src)
+			cl.AddConsumeTopics(src)
+		}
 		switch {
 		case fetches.NumRecords() > 0:
 			badSince = time.Time{}
@@ -286,7 +361,7 @@ func runKafka(ctx context.Context, broker, src, group string, c *collector, out 
 				kafkaErrs.flush()
 				w.stop()
 				out.close()
-				return fmt.Errorf("kafka 읽기 오류가 %s 넘게 계속됨 : 끝냄 (systemd 가 다시 띄움)", kafkaDeadAfter)
+				return fmt.Errorf("kafka read errors for more than %s : exiting (systemd restarts)", kafkaDeadAfter)
 			}
 			time.Sleep(time.Second) // 오류만 올 때 빈 돌기 막기
 		}
@@ -302,9 +377,10 @@ func runKafka(ctx context.Context, broker, src, group string, c *collector, out 
 		if time.Since(tick) >= time.Minute {
 			tick = time.Now()
 			c.logStat(out)
+			sdNotify("WATCHDOG=1")
 			if out.dead() {
 				w.stop()
-				return fmt.Errorf("kafka 보내기가 %s 넘게 안 됨 : 끝냄 (systemd 가 다시 띄움)", kafkaDeadAfter)
+				return fmt.Errorf("kafka produce failing for more than %s : exiting (systemd restarts)", kafkaDeadAfter)
 			}
 		}
 	}
@@ -316,4 +392,56 @@ func startOffset() kgo.Offset {
 		return kgo.NewOffset().AtStart()
 	}
 	return kgo.NewOffset().AtEnd()
+}
+
+// ---- key 나누기의 partition 고르기 (0.2.0, -key-buckets > 0 일 때만) ----
+//
+// key "<peer hash>.<칸>" (unicast_prefix) : partition = (murmur2(peer hash) + 칸) % n.
+// 한 peer 의 칸들이 이웃 partition 에 하나씩 놓여 (칸 8 개, partition 8 개면 모든 partition 에 정확히 하나)
+// 큰 peer 도 고르게 퍼짐. key 를 murmur2 에 그대로 맡기면 칸끼리 같은 partition 에 몰릴 수 있음
+// (11-01 RIB 7,894 만 줄 실측 : peer hash 만 = 최대 / 최소 1.73, key 나누기 + Kafka murmur2 = 1.21, 이 방식 = 1.00).
+// 같은 router + peer + 프리픽스 = 같은 칸 = 같은 partition (순서 유지). 그 밖의 key (peer, router, bmp_raw) 는
+// Kafka 기본 (Java 클라이언트, franz-go 기본) 과 같은 murmur2(key) % n = 지금과 같은 partition
+func bucketPartition(r *kgo.Record, n int) int {
+	k := r.Key
+	if i := bytes.LastIndexByte(k, '.'); i == 32 { // md5 글자 32 자 + "." + 칸
+		if b, err := strconv.Atoi(string(k[i+1:])); err == nil && b >= 0 {
+			return int((uint64(murmur2(k[:i])&0x7fffffff) + uint64(b)) % uint64(n))
+		}
+	}
+	return int(murmur2(k)&0x7fffffff) % n
+}
+
+// murmur2 : Kafka 의 key 해시 (Java 클라이언트 Utils.murmur2 와 같음)
+func murmur2(b []byte) uint32 {
+	const (
+		seed uint32 = 0x9747b28c
+		m    uint32 = 0x5bd1e995
+		r           = 24
+	)
+	h := seed ^ uint32(len(b))
+	for len(b) >= 4 {
+		k := uint32(b[3])<<24 | uint32(b[2])<<16 | uint32(b[1])<<8 | uint32(b[0])
+		b = b[4:]
+		k *= m
+		k ^= k >> r
+		k *= m
+		h *= m
+		h ^= k
+	}
+	switch len(b) {
+	case 3:
+		h ^= uint32(b[2]) << 16
+		fallthrough
+	case 2:
+		h ^= uint32(b[1]) << 8
+		fallthrough
+	case 1:
+		h ^= uint32(b[0])
+		h *= m
+	}
+	h ^= h >> 13
+	h *= m
+	h ^= h >> 15
+	return h
 }

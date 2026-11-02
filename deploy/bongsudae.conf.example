@@ -31,11 +31,20 @@ allow  = 127.0.0.1, ::1              # routers allowed to connect : addresses / 
 raw    = true                        # forward every received BMP message to openbmp.bmp_raw (reload)  option -raw
 chash  =                             # C_HASH_ID in message headers, 32 hex digits (restart)        option -chash
                                      #   empty = md5(host name). Also used in router hashes : keep it stable
+rib    = true                        # keep per-peer route tables in memory (restart)              option -rib
+                                     #   false = forward only : much less memory, no route counts / prefix lookup API
 
 
 [kafka]
 brokers = 127.0.0.1:9092             # Kafka bootstrap servers (restart)                            option -kafka
 prefix  = openbmp.parsed             # topic prefix : <prefix>.unicast_prefix / .peer / .router (restart)  option -prefix
+key_buckets = 0                      # unicast_prefix key : 0 = peer hash, N = <peer hash>.<bucket> (restart)  option -key-buckets
+format  = openbmp                    # message format : openbmp (v1.7, tab separated) or json (one object per line) (restart)  option -format
+                                     #   spreads a big peer over N buckets (by prefix) ; see docs/kafka.md
+partitions  = 8                      # partitions of topics the collector creates (restart)        option -partitions
+replication = 1                      # replication factor of topics it creates (restart)           option -replication
+retention   = 90m                    # retention of topics it creates (restart)                    option -retention
+                                     #   existing topics are never changed
 
 
 [http]
@@ -43,3 +52,4 @@ listen =                             # HTTP API address, empty = off (restart)  
                                      #   e.g. 127.0.0.1:5001 (local only) or :5001
 allow  =                             # clients allowed to use the API, others get 403 (reload)      option -http-allow
                                      #   empty = everyone who can connect. e.g. 127.0.0.1, ::1, 198.51.100.0/24
+

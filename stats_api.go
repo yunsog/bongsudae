@@ -22,6 +22,8 @@ type minuteStat struct {
 	Raw       *int64                `json:"raw,omitempty"`    // bmp_raw 로 보낸 수 (tcp 입력만)
 	KafkaFail int64                 `json:"kafka_fail_total"` // 시작 뒤 보내기 실패 모두
 	Topics    map[string]topicCount `json:"topics,omitempty"` // 토픽별 메시지 / 줄 (전달 규칙)
+	// ByRouter : 라우터별 같은 수 (0.2.0, 그 1 분에 메시지나 오류가 있던 라우터만). ?by_router=1 일 때만 내보냄
+	ByRouter map[string]map[string]int `json:"by_router,omitempty"`
 }
 
 // statHist : 최근 1 분 통계들 (logStat 이 넣고 API 가 읽음)
@@ -30,14 +32,20 @@ type statHist struct {
 	list    []minuteStat
 	started time.Time
 	kafka   *producer // 마지막 logStat 의 producer (nil = 파일 입력)
+	cum     stats     // 시작 뒤 1 분 통계를 모두 더한 것 (/metrics 의 _total, 0.2.0)
+	rawCum  int64     // 시작 뒤 bmp_raw 로 보낸 수
 }
 
 var hist = statHist{started: time.Now()}
 
-// add : logStat 이 1 분마다 부름
-func (h *statHist) add(m minuteStat, p *producer) {
+// add : logStat 이 1 분마다 부름 (total = 이 1 분의 합계)
+func (h *statHist) add(m minuteStat, total *stats, p *producer) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	h.cum.addAll(total)
+	if m.Raw != nil {
+		h.rawCum += *m.Raw
+	}
 	h.list = append(h.list, m)
 	if len(h.list) > statKeep {
 		h.list = h.list[len(h.list)-statKeep:]
@@ -45,6 +53,13 @@ func (h *statHist) add(m minuteStat, p *producer) {
 	if p != nil {
 		h.kafka = p
 	}
+}
+
+// totals : 시작 뒤 누적 (/metrics)
+func (h *statHist) totals() (stats, int64, *producer) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.cum, h.rawCum, h.kafka
 }
 
 // counts : 통계를 이름 -> 수 로 (0 인 BMP 종류는 뺌, 나머지는 늘 넣음)
@@ -64,8 +79,9 @@ func (s *stats) counts() map[string]int {
 	return m
 }
 
-// release : 판 번호 (GitHub 공개판과 같음). 판을 올릴 때 고침
-const release = "0.1"
+// release : 판 번호 (GitHub 태그 v<release> 와 같음, 세 자리 = Go 모듈 판). 개발 중에는 "-dev" 를 붙이고,
+// 올리는 날 떼어 냄 (0.1.0 = 11-01 첫 공개, 0.2.0 = 11-03 공개)
+const release = "0.2.0"
 
 // version : 빌드 정보의 git rev (+ 빌드 때 고친 것이 있으면 "-modified")
 func version() string {
@@ -98,16 +114,17 @@ func unixStr(ns int64) string {
 }
 
 type statsJSON struct {
-	Release   string       `json:"release"` // 판 번호 (0.1)
-	Version   string       `json:"version"` // git rev
-	Started   string       `json:"started"`
-	UptimeS   int64        `json:"uptime_s"`
-	HeapMB    uint64       `json:"heap_mb"`
-	SysMB     uint64       `json:"sys_mb"`
-	NumGC     uint32       `json:"gc_cycles"`
-	Goroutine int          `json:"goroutines"`
-	Kafka     *kafkaJSON   `json:"kafka,omitempty"`
-	Minutes   []minuteStat `json:"minutes"` // 오래된 것부터, 최대 60
+	Release   string        `json:"release"` // 판 번호 (0.1)
+	Version   string        `json:"version"` // git rev
+	Started   string        `json:"started"`
+	UptimeS   int64         `json:"uptime_s"`
+	HeapMB    uint64        `json:"heap_mb"`
+	SysMB     uint64        `json:"sys_mb"`
+	NumGC     uint32        `json:"gc_cycles"`
+	Goroutine int           `json:"goroutines"`
+	Kafka     *kafkaJSON    `json:"kafka,omitempty"`
+	Handover  *handoverJSON `json:"handover,omitempty"` // 무중단 판 올리기 (0.2.0, tcp 입력만, handover.go)
+	Minutes   []minuteStat  `json:"minutes"`            // 오래된 것부터, 최대 60
 }
 
 type kafkaJSON struct {
@@ -125,6 +142,12 @@ func (c *collector) apiStats(w http.ResponseWriter, req *http.Request) {
 	j.Minutes = append([]minuteStat{}, hist.list...)
 	p := hist.kafka
 	hist.mu.Unlock()
+	if req.URL.Query().Get("by_router") != "1" { // 기본은 합계만 (라우터별은 커서 원할 때만)
+		for i := range j.Minutes {
+			j.Minutes[i].ByRouter = nil
+		}
+	}
+	j.Handover = upg.statsInfo()
 	if p != nil {
 		j.Kafka = &kafkaJSON{FailsTotal: p.fails.Load(), LastOK: unixStr(p.lastOK.Load()), LastFail: unixStr(p.lastFail.Load())}
 	}

@@ -47,7 +47,11 @@ type ruleSet struct {
 }
 
 // rules : 지금 규칙 + 파일 상태 + 토픽별 1 분 통계
+// 잠금 둘 (0.2.0) : editMu = 편집 (change / reload : 파일 읽기, 검사, 쓰기, fsync) 을 하나씩.
+// mu = set / sum / loaded 를 바꿔 끼우는 짧은 순간만 (라우터 goroutine 의 topics() 가 RLock).
+// set / sum 은 두 잠금을 다 잡고 바꾸므로 읽기는 둘 중 하나만 잡으면 됨. 순서 editMu -> mu
 type rules struct {
+	editMu  sync.Mutex
 	mu      sync.RWMutex
 	path    string
 	set     *ruleSet  // 바꿀 때는 복사본을 만들어 통째로 바꿈
@@ -60,7 +64,10 @@ type rules struct {
 	cur, last map[string]*topicCount // 지금 1 분, 지난 1 분
 }
 
-type topicCount struct{ Msgs, Rows int }
+type topicCount struct {
+	Msgs int `json:"msgs"` // 메시지 수 (/api/stats 의 topics : 0.2.0 전에는 꼬리표가 없어 "Msgs" / "Rows" 로 나갔음)
+	Rows int `json:"rows"` // 줄 수
+}
 
 var topicName = regexp.MustCompile(`^unicast_prefix[A-Za-z0-9_.-]{0,64}$`)
 
@@ -121,7 +128,7 @@ func jsonErr(b []byte, err error) string {
 // check : 검사하고 주소 / 토픽 목록을 정리 (주소 정규화, 토픽 중복 제거)
 func (s *ruleSet) check() error {
 	if s.Default == nil {
-		return errors.New(`"default" 없음 (보내지 않으려면 [])`)
+		return errors.New(`"default" missing (use [] to send nothing)`)
 	}
 	var err error
 	if s.Default, err = checkTopics(s.Default); err != nil {
@@ -137,7 +144,7 @@ func (s *ruleSet) check() error {
 			return fmt.Errorf("router %s: null", ip)
 		}
 		if routers[key] != nil {
-			return fmt.Errorf("router %s: 두 번 나옴", key)
+			return fmt.Errorf("router %s: listed twice", key)
 		}
 		if rr.Topics != nil {
 			t, err := checkTopics(*rr.Topics)
@@ -153,10 +160,10 @@ func (s *ruleSet) check() error {
 				return fmt.Errorf("router %s peer %q: %w", key, pip, err)
 			}
 			if t == nil {
-				return fmt.Errorf("router %s peer %s: null (보내지 않으려면 [])", key, pk)
+				return fmt.Errorf("router %s peer %s: null (use [] to send nothing)", key, pk)
 			}
 			if _, dup := peers[pk]; dup {
-				return fmt.Errorf("router %s peer %s: 두 번 나옴", key, pk)
+				return fmt.Errorf("router %s peer %s: listed twice", key, pk)
 			}
 			if peers[pk], err = checkTopics(t); err != nil {
 				return fmt.Errorf("router %s peer %s: %w", key, pk, err)
@@ -177,7 +184,7 @@ func checkTopics(in []string) ([]string, error) {
 	out := []string{}
 	for _, t := range in {
 		if !topicName.MatchString(t) {
-			return nil, fmt.Errorf("토픽 이름 %q : unicast_prefix 로 시작, 글자는 A-Z a-z 0-9 _ . -", t)
+			return nil, fmt.Errorf("topic name %q : must start with unicast_prefix, characters A-Z a-z 0-9 _ . -", t)
 		}
 		if !slices.Contains(out, t) {
 			out = append(out, t)
@@ -190,7 +197,7 @@ func checkTopics(in []string) ([]string, error) {
 func normIP(s string) (string, error) {
 	a, err := netip.ParseAddr(s)
 	if err != nil {
-		return "", errors.New("주소가 아님")
+		return "", errors.New("not an address")
 	}
 	return a.Unmap().String(), nil
 }
@@ -373,12 +380,13 @@ func (rl *rules) ensureAll(topics []string) error {
 	return nil
 }
 
-var errFileChanged = errors.New("규칙 파일이 손으로 바뀌었음 (아직 적용 안 됨) : 먼저 -reload")
+var errFileChanged = errors.New("rules file was edited by hand (not applied yet) : -reload first")
 
 // change : 규칙 하나를 바꾸고 파일에 씀. edit 은 복사본을 고침 (오류면 아무것도 안 바뀜)
+// 파일 I/O 는 editMu 만 잡고 함 (rl.mu 를 잡으면 그동안 모든 라우터 처리가 topics() 에서 멈춤)
 func (rl *rules) change(edit func(s *ruleSet) error) error {
-	rl.mu.Lock()
-	defer rl.mu.Unlock()
+	rl.editMu.Lock()
+	defer rl.editMu.Unlock()
 	// 손으로 고친 것을 덮어쓰지 않게
 	var sum [32]byte
 	if b, err := os.ReadFile(rl.path); err == nil {
@@ -404,7 +412,9 @@ func (rl *rules) change(edit func(s *ruleSet) error) error {
 	if err := writeAtomic(rl.path, b); err != nil {
 		return err
 	}
+	rl.mu.Lock()
 	rl.set, rl.sum, rl.loaded = n, sha256.Sum256(b), time.Now()
+	rl.mu.Unlock()
 	return nil
 }
 
@@ -435,7 +445,10 @@ func writeAtomic(path string, b []byte) error {
 }
 
 // reload : 파일을 다시 읽어 적용. 오류면 이전 규칙 그대로. 돌려주는 것 = 바뀐 줄들
+// editMu 를 잡고 읽기부터 바꿔 끼우기까지 (그 사이에 change 가 끼어들어 옛 내용으로 덮어쓰지 않게)
 func (rl *rules) reload() ([]string, error) {
+	rl.editMu.Lock()
+	defer rl.editMu.Unlock()
 	set, sum, err := readRules(rl.path)
 	if err != nil {
 		return nil, err // 파일이 없는 것도 오류 (실수로 지워서 모두 기본으로 가는 것을 막음)
@@ -454,10 +467,10 @@ func (rl *rules) reload() ([]string, error) {
 func (rl *rules) reloadLog(who string) ([]string, error) {
 	changes, err := rl.reload()
 	if err != nil {
-		log.Printf("rules reload (%s): %v (이전 규칙 그대로)", who, err)
+		log.Printf("rules reload (%s): %v (previous rules kept)", who, err)
 		return nil, err
 	}
-	log.Printf("rules reload (%s): %d 바뀜", who, len(changes))
+	log.Printf("rules reload (%s): %d changed", who, len(changes))
 	for _, c := range changes {
 		log.Printf("rules   %s", c)
 	}

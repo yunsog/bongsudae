@@ -57,6 +57,7 @@ All routers, sorted by address. Array.
   "routes_v4": 30,
   "routes_v6": 37960,
   "peers_synced": 9,
+  "peers_settled": 9,
   "kafka": ["unicast_prefix"],
   "kafka_from": "default",
   "warn": ["reconnected 2 times"]
@@ -78,6 +79,7 @@ All routers, sorted by address. Array.
 | peers_up / peers_down | Number of peers in each state |
 | routes_v4 / routes_v6 | Sum of the route counts of all peers of this router |
 | peers_synced | Number of up peers whose initial table transfer is complete (see `synced` below). Progress after a reconnect / reset: peers_synced / peers_up |
+| peers_settled | Number of up peers that are `settled` (see below). Progress for routers that do not forward End-of-RIB |
 | last_reset, last_reset_why | Time and reason of the last time the collector closed the session (reset API). Omitted if none |
 | last_term | Why the session last ended, e.g. `term 0 ...`, `connection closed`. Omitted if none |
 | kafka, kafka_from | unicast_prefix topics for this router (router level) and where that comes from: `router` / `default`. `[]` = not sent |
@@ -89,23 +91,26 @@ One router object as above, plus `"peers": [...]` (peer objects as in section 3,
 
 ### GET /api/stats
 Is the collector healthy? The 1-minute statistics (the same numbers as the `stat ...` lines in the log) for the
-last 60 minutes, plus release, memory and Kafka state. History is lost when the collector restarts.
+last 60 minutes, plus release, memory and Kafka state. History is lost when the collector restarts
+(a hitless upgrade keeps it, and `started`).
 
 ```json
-{"release": "0.1", "version": "1a2b3c4", "started": "2026-10-30T20:58:01+09:00", "uptime_s": 3600,
+{"release": "0.2.0", "version": "1a2b3c4", "started": "2026-10-30T20:58:01+09:00", "uptime_s": 3600,
  "heap_mb": 9800, "sys_mb": 14500, "gc_cycles": 210, "goroutines": 60,
  "kafka": {"fails_total": 0, "last_ok": "2026-10-30T21:58:01+09:00"},
+ "handover": {"supported": true, "count": 1, "last_at": "2026-11-05T10:00:03+09:00", "from": "0.2.0 1a2b3c4",
+              "pause_ms": 5400, "rib_loading": false, "rib_load_ms": 12400},
  "minutes": [
   {"time": "2026-10-30T21:58:01+09:00", "routers": 25,
    "counts": {"route_mon": 51232, "stats": 66, "errors": 0, "others": 0, "add": 75008, "del": 15124, "msgs": 51232,
               "router_msgs": 0, "peer_msgs": 0, "not_sent": 0, "peer_up_no_open": 0},
-   "raw": 51232, "kafka_fail_total": 0, "topics": {"unicast_prefix": {"Msgs": 51232, "Rows": 90132}}}
+   "raw": 51232, "kafka_fail_total": 0, "topics": {"unicast_prefix": {"msgs": 51232, "rows": 90132}}}
  ]}
 ```
 
 | Field | Meaning |
 |---|---|
-| release | Release number of the binary, e.g. `0.1` |
+| release | Release number of the binary, e.g. `0.2.0` (same as the Git tag `v0.2.0`; development builds end in `-dev`) |
 | version | git revision of the binary (with `-modified` if the tree had local changes at build time) |
 | started, uptime_s | Start time of the collector, seconds since then |
 | heap_mb / sys_mb | Go heap / memory obtained from the OS (close to RSS) |
@@ -115,10 +120,42 @@ last 60 minutes, plus release, memory and Kafka state. History is lost when the 
 | counts | BMP type counts (`route_mon`, `peer_up`, ...) are omitted when zero; the other keys are always present |
 | raw | Messages sent to the bmp_raw topic in that minute (tcp input only) |
 | kafka_fail_total | Produce failures since start, as of that minute |
-| topics | Messages / rows per unicast_prefix topic (forwarding rules). Note the keys are `Msgs` and `Rows` |
+| topics | Messages / rows per unicast_prefix topic (forwarding rules): `{"msgs": N, "rows": N}` (0.1 used the keys `Msgs` / `Rows`) |
+| handover | (0.2.0+, tcp input only = this release can do a hitless upgrade; missing = 0.1, `-upgrade` will not work) supported, count (upgrades since the last restart), last_at / from (time of the last upgrade and the release it came from), pause_ms (how long reading from routers was paused), rib_loading (route tables still loading in the background: route counts / lookups are incomplete), rib_load_ms, last_error / last_error_at (why the last attempt gave up; the old process kept running). `bongsudae -upgrade` reads this |
+| by_router | (0.2.0+, only with `?by_router=1`) router address -> counts in the same form, only for routers that had messages or errors in that minute |
 
 What to watch: whether `counts.errors` or `kafka.fails_total` grows, whether `kafka.last_ok` has stopped for
 more than a minute, and `raw` ≈ `counts.route_mon` + the other BMP message counts.
+
+### GET /metrics
+
+The same numbers in the Prometheus text exposition format 0.0.4 (`Content-Type: text/plain; version=0.0.4`), without a client library.
+It is outside `/api/` but served on the same address, with the same `http.allow` and concurrency limit.
+Scrape config example: `scrape_configs: [{job_name: bongsudae, static_configs: [{targets: ["collector.example:5001"]}]}]`
+
+| Name | Type | Labels | Meaning |
+|---|---|---|---|
+| bongsudae_info | gauge | release, version | always 1 |
+| bongsudae_start_time_seconds | gauge | | Unix time of the first start (kept across `-upgrade`) |
+| bongsudae_router_up | gauge | router, name | 1 if the BMP session is up |
+| bongsudae_router_last_message_age_seconds | gauge | router | seconds since the last BMP message (-1 = none yet) |
+| bongsudae_router_connects_total | counter | router | Initiation messages received |
+| bongsudae_router_bmp_messages_total | counter | router, type | BMP messages by type (`route_mon`, `peer_up`, ...) |
+| bongsudae_router_errors_total | counter | router | messages that could not be parsed |
+| bongsudae_router_peer_up_no_open_total | counter | router | Peer Up messages without the OPENs |
+| bongsudae_peers | gauge | router, state | state = `up` / `down` / `synced` / `settled` |
+| bongsudae_routes | gauge | router, afi | prefixes in the route tables (`4` / `6`) |
+| bongsudae_rows_total | counter | action | unicast_prefix rows (`add` / `del`) |
+| bongsudae_rows_not_sent_total | counter | | rows not sent because of forwarding rules |
+| bongsudae_kafka_messages_total | counter | kind | produced messages (`unicast_prefix`, `router`, `peer`, `bmp_raw`) |
+| bongsudae_other_afi_total | counter | | MP_REACH / MP_UNREACH of other address families (counted, dropped) |
+| bongsudae_kafka_fails_total | counter | | Kafka produce failures (absent with file input) |
+| bongsudae_kafka_last_ok_time_seconds | gauge | | Unix time of the last successful produce |
+| go_memstats_heap_alloc_bytes, go_memstats_sys_bytes, go_gc_cycles_total, go_goroutines | | | Go runtime (same names as the Prometheus Go client) |
+
+- Per-router values are computed per request (same as `/api/routers`). Global totals are sums of the one-minute statistics, so they grow once a minute.
+- After a restart or `-upgrade` the `_total` counters start from 0 (Prometheus `rate()` handles counter resets).
+- Alert examples: `bongsudae_router_up == 0`, `increase(bongsudae_router_errors_total[10m]) > 0`, `time() - bongsudae_kafka_last_ok_time_seconds > 120`
 
 ## 3. Peers
 
@@ -128,8 +165,8 @@ Peers of all routers (by router, then by peer address). Array. Query parameters 
 | Parameter | Meaning |
 |---|---|
 | router=IP | Only this router |
-| state=up / down | Only this state |
-| as=N | Only this peer AS |
+| state=up / down | Only this state (any other value is a 400) |
+| as=N | Only this peer AS (not a number: 400) |
 | warn=1 | Only peers with a warning |
 
 ```json
@@ -166,6 +203,7 @@ Peers of all routers (by router, then by peer address). Array. Query parameters 
 | state, since | `up` / `down`, and when it became so |
 | peer_up | Whether a Peer Up was received in the current BMP session (if true, the route count is exact from the start) |
 | synced | Initial table transfer complete = an End-of-RIB was received for every unicast family (IPv4 / IPv6) negotiated by both OPENs. False without a Peer Up or without the OPENs |
+| settled | `synced`, or the peer has been up for 5 minutes and no new prefix arrived for 5 minutes (changes and withdrawals do not count). For routers that do not forward End-of-RIB over BMP. Only up peers with a Peer Up. Right after `-upgrade`, peers up for more than 5 minutes are settled at once (the time of the last new prefix is not handed over) |
 | eor_v4 / eor_v6 | When End-of-RIB was received (omitted if not). Observed: 19 s (3,937 messages) and 225 s (5,525 messages) after Peer Up |
 | routes_v4 / routes_v6 | Number of prefixes currently alive |
 | last_update | Time of the last UPDATE (omitted if none) |
@@ -201,6 +239,7 @@ One peer plus `"detail"`. 404 if the router or peer is unknown.
   Empty if no Peer Up was received (ports and hold times are then 0).
 - `history`: the last 10 events, oldest first: `up (Peer Up)`, `seen in route monitoring (no Peer Up)`,
   `End-of-RIB IPv4 (routes N)`, `End-of-RIB IPv6 (routes N)`, `down : ...`.
+- `bmp_stats` / `bmp_stats_at` (0.2.0+, inside `detail`, omitted if none received): the last BMP Statistics Report (RFC 7854 4.8) the router sent for this peer. Names follow the IANA types (`rejected_prefixes`, `duplicate_prefix_advertisements`, `adj_rib_in_routes`, `loc_rib_routes`, `updates_treat_as_withdraw`, ...); per address family values get `_<afi>_<safi>` (e.g. `adj_rib_in_routes_1_1` = IPv4 unicast); unknown types are `type_N`. Only for known peers (a Stats Report never creates a peer).
 
 ### POST /api/routers/{ip}/reset (key required)
 The collector closes the router's BMP session (TCP). The router reconnects and sends Initiation, Peer Up for
@@ -259,7 +298,7 @@ One route row (JSON):
 ```
 - Fields with empty strings may be left out of the JSON (communities through aggregator).
 - `as_path` is the AS path text without the leading space used in the Kafka messages.
-- If the path ends with an AS_SET: `origin_as` is 0 and `origin_as_set` holds the set text (`"{64510,64511}"`).
+- If the path ends with an AS_SET of two or more ASes: `origin_as` is 0 and `origin_as_set` holds the set text (`"{64510,64511}"`). A set of one AS (`{64512}`) gives `origin_as` 64512 and no `origin_as_set` (0.2.0+).
   The set in `as_path` is written `{64510,64511}` as well (RFC style; openbmpd wrote `{ a b }`).
   In `format=text` the origin_as column contains the set text. For the origin filter the origin is "unknown"
   (such rows are kept by `not_origin`).
@@ -305,7 +344,7 @@ JSON is an array of route rows (one object per line). Text columns:
 | match= | `exact` (default) that prefix / `longest` the longest prefix covering it (one per peer) / `covering` all prefixes covering it (the prefix itself and shorter ones) / `more` the prefix and all more-specific prefixes inside it |
 | origin_as=N[,N...] | Only these origins |
 | not_origin=N[,N...] | Exclude these origins (hijack check) |
-| limit=N | First N rows only (applied after the filters) |
+| limit=N | First N rows only (applied after the filters). Not a number: 400 |
 | format=text | Tab-separated text, same columns as the lists. total is in the `X-Total` response header |
 
 ```json
@@ -323,7 +362,7 @@ JSON is an array of route rows (one object per line). Text columns:
 - The filter is applied first and limit afterwards, so suspicious rows cannot hide behind the limit.
 - How the origin of a row is decided:
   - Normally: the last AS in as_path (= the origin_as field).
-  - as_path ends with an AS_SET (`... {a,b}`): **origin unknown** -> not excluded by not_origin (kept as a
+  - as_path ends with an AS_SET of two or more ASes (`... {a,b}`; a single-AS set `{a}` means a): **origin unknown** -> not excluded by not_origin (kept as a
     suspicious row), never matches origin_as.
   - as_path is empty (iBGP, a route originated inside the local AS; origin_as field is 0): origin = the peer's AS (peer_as).
 
@@ -442,10 +481,10 @@ requests are refused with 403.
 
 | Code | Meaning |
 |---|---|
-| 400 | Invalid value (address, prefix, match, origin_as / not_origin, path_as, offset / limit, topic name, X-Actor, body, number of p entries), or a failed rules reload |
+| 400 | Invalid value (address, prefix, match, origin_as / not_origin, path_as, offset / limit, as / state of /api/peers, topic name, X-Actor, body, number of p entries), or a failed rules reload |
 | 403 | Wrong key / key file missing or too short. Client address outside `http.allow` |
 | 404 | Unknown router / peer, DELETE of a rule that does not exist, reset of a router that is not connected |
-| 409 | The rules file was edited by hand and not yet reloaded -> reload first. Reset called when the input is not tcp |
+| 409 | Route list / prefix lookup while route tables are off (`-rib=false`, 0.2.0+). The rules file was edited by hand and not yet reloaded -> reload first. Reset called when the input is not tcp |
 | 429 | Reset of the same router again within 10 minutes (see the Retry-After header) |
 | 500 | Writing the rules file / creating a topic failed |
 

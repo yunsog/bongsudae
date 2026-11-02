@@ -7,7 +7,7 @@ publishes OpenBMP v1.7 format messages to Kafka, and serves routers, peers and t
 
 | Item | Details |
 |---|---|
-| Release | Bongsudae 0.1 (`GET /api/stats` returns `release` = `0.1` and `version` = git revision) |
+| Release | Bongsudae 0.2.0 (`GET /api/stats` returns `release` = `0.2.0` and `version` = git revision) |
 | Binary | A single Go binary, `bongsudae`. It receives, parses, publishes to Kafka, keeps the routing table and serves the HTTP API. The only external library is the Kafka client (franz-go), vendored |
 | Requirements | Linux, Kafka (tested with Apache Kafka 4.x in KRaft mode), enough memory for the routing table (section 6.2) |
 | Standards | BMP RFC 7854; BGP RFC 4271, 4760 (multiprotocol), 6793 (4-byte AS), 7911 (Add-Path); communities RFC 1997, 4360, 5668, 8092 |
@@ -80,7 +80,7 @@ sudo -u bongsudae sh -c 'head -c 24 /dev/urandom | base64 > /var/lib/bongsudae/c
 # 5) Check, start, verify
 bongsudae -t                                  # check config file + rules file
 sudo systemctl enable --now bongsudae
-journalctl -u bongsudae -f                    # "start bongsudae 0.1 ...", "conn <ip>: initiation" per router, "stat ..." every minute
+journalctl -u bongsudae -f                    # "start bongsudae 0.2.0 ...", "conn <ip>: initiation" per router, "stat ..." every minute
 bongsudae -status                             # router table
 ```
 
@@ -120,6 +120,7 @@ Selected by `-input` and command options. With none of them Bongsudae runs in **
 | Shadow | `bongsudae -input kafka -prefix openbmp.test [-src openbmp.bmp_raw] [-group bmp-test-NAME]` | Reads bmp_raw from Kafka in real time and writes to test topics. Does not read the config file. `-prefix openbmp.parsed` (and `openbmp`) is refused; the group must start with `bmp-test-` |
 | File | `bongsudae -input file -in DUMP -out PREFIX\|none [-http 127.0.0.1:5002]` | bmp_raw dump file -> one dump file per message type (no Kafka). With `-http`, keeps the API open after processing (rule changes disabled) |
 | Check | `bongsudae -t` | Checks the config file and the rules file, then exits |
+| Upgrade | `bongsudae -upgrade` | (0.2.0+) Replaces the running collector with the new binary at the same path. Router sessions stay up (6.8) |
 | API client | `bongsudae -status / -set / -del / -post / -reload ...` | Calls the HTTP API of a running Bongsudae (section 8.3). Reads the config file to find the key file |
 
 ### 4.2 All options
@@ -148,6 +149,12 @@ Options with a "Config key" can also be set in the config file (section 5). "Rel
 | Option | Default | Config key | Reload | Meaning |
 |---|---|---|---|---|
 | `-kafka` | `127.0.0.1:9092` | `kafka.brokers` | restart | Kafka bootstrap address |
+| `-partitions` | `8` | `kafka.partitions` | restart | Partitions of topics the collector creates (existing topics are not changed) |
+| `-replication` | `1` | `kafka.replication` | restart | Replication factor of topics the collector creates |
+| `-retention` | `90m` | `kafka.retention` | restart | Retention (retention.ms) of topics the collector creates, at least 1m |
+| `-rib` | `true` | `bmp.rib` | restart | Keep per-peer route tables in memory. `false` = forward only (much less memory): Kafka output is the same, route counts are 0, the prefix list / lookup API returns 409 |
+| `-key-buckets` | `0` | `kafka.key_buckets` | restart | Split the unicast_prefix Kafka key (0 = one key per peer, N = N buckets by prefix, key `<peer hash>.<bucket>`, 0 to 64). See docs/kafka.md section 1 |
+| `-format` | `openbmp` | `kafka.format` | restart | Message format of unicast_prefix / router / peer: `openbmp` (v1.7, tab separated) or `json` (one JSON object per line). bmp_raw is unchanged. kafka.md 2.1 |
 | `-prefix` | `openbmp.parsed` | `kafka.prefix` | restart | Output topic prefix (`<prefix>.unicast_prefix / .router / .peer`). For tests use `openbmp.test` |
 | `-src` | `openbmp.bmp_raw` | - | - | Shadow: topic to read |
 | `-group` | `bmp-test-shadow` | - | - | Shadow: consumer group (must be `bmp-test-*`) |
@@ -171,6 +178,8 @@ Options with a "Config key" can also be set in the config file (section 5). "Rel
 | `-topics` | Topics for `-set` (comma separated, `none` = do not send) |
 | `-json` | Print the received JSON instead of a table |
 | `-api` | Server to call (default `http://127.0.0.1:5001`) |
+| `-upgrade` | Hitless upgrade (6.8): sends SIGUSR2 to the pid in the lock file and waits for the result in `/api/stats` |
+| `-resume`, `-handover-check` | Internal (the handover exec / checking the new binary). Never needed by hand |
 
 Value formats: lists are comma separated (`192.0.2.0/24, 2001:db8::1`); a single address means /32 (IPv6 /128); booleans are `true` / `false`.
 
@@ -207,6 +216,7 @@ chash  =                             # (restart) empty = md5(hostname)
 [kafka]
 brokers = 127.0.0.1:9092             # (restart)
 prefix  = openbmp.parsed             # (restart)
+format  = openbmp                    # (restart) openbmp | json
 
 [http]
 listen = 127.0.0.1:5001              # (restart) empty = API off
@@ -236,6 +246,10 @@ allow  =                             # empty = everyone (firewall only)
 - Some routers send IPv4 routes in MP_REACH; both forms are handled. 4-byte AS is taken from the A flag of the per-peer header.
 - No del rows are generated on Peer Down (same as openbmpd). When a router disconnects only a router term message is sent; consumers should treat it as "all peers of that router are down".
 - Routing table: live prefixes per peer (the same add several times = 1, del removes). Peer down, a new Peer Up, or router disconnect resets it to 0. Path attributes are shared between routes.
+- Done yet? `synced` = End-of-RIB received. `settled` = synced, or up for 5 minutes with no new prefix for 5 minutes
+  (for routers that do not forward End-of-RIB over BMP; API `settled` / `peers_settled`, SYNCED column of `-status` = yes / settled / no).
+- Allocation: rows are written straight into reused per-router buffers, with the parts shared by all rows of an UPDATE (router, peer, attributes) built once;
+  each BMP message is allocated once when read (bmp_raw uses the same bytes). Benchmark: `BONGSUDAE_BENCH_DUMP=<bmp_raw dump> go test -run '^$' -bench Process -benchmem .`
 - Memory: about 65 bytes per route, so a full table of ~1M routes uses about 80 MB per peer. Many full-table peers add up: roughly 100 million routes in total needs a resident size of 11–15 GB.
 
 ### 6.3 Kafka output and failure handling
@@ -243,8 +257,12 @@ allow  =                             # empty = everyone (firewall only)
 - **When the buffer is full, reading from that router pauses** -> TCP flow control slows the router down (nothing is dropped).
 - Kafka errors are logged as a summary: one line per error type per minute.
 - A short Kafka restart (tens of seconds): the client reconnects on its own.
-- **No successful produce for 2 minutes** (or, in shadow mode, only read errors for 2 minutes): Bongsudae exits -> systemd restarts it (= resync). This covers, for example, a topic that was deleted and re-created with a new topic ID.
-- `kill` / `systemctl stop` (SIGTERM): sends what is left in the buffer, then exits.
+- **A topic deleted or re-created with a new topic ID** (0.2.0+): when a produce / fetch error is UNKNOWN_TOPIC_ID or UNKNOWN_TOPIC_OR_PARTITION, the client drops what it knows about that topic and reads it again (creating it if missing), at most every 30 s per topic. Log: `kafka topic <topic> : unknown topic (deleted / re-created?), re-reading topic metadata`. Only the records of that topic buffered at the time (about 15 s) are lost; there is no restart and no resync.
+- **No successful produce for 2 minutes** (or, in shadow mode, only read errors for 2 minutes): Bongsudae exits -> systemd restarts it (= resync). This is for Kafka being down altogether.
+- Topics the collector creates (first use, new topics in the rules) get `kafka.partitions` / `kafka.replication` / `kafka.retention` (default 8 / 1 / 90m). Existing topics are never changed.
+- **watchdog** (0.2.0+, unit file `WatchdogSec=180`, `NotifyAccess=main`): after each 1-minute statistics pass (which takes every router lock in turn) Bongsudae sends `WATCHDOG=1` to systemd. If it is alive but stuck (e.g. a deadlock), systemd restarts it after 180 s. It also sends `READY=1` at start and `STOPPING=1` on shutdown.
+- `kill` / `systemctl stop` (SIGTERM, 0.2.0+): stops accepting, closes every router connection (one router term 65534 `Closed by collector: shutdown` per router), waits up to 10 s for the router goroutines, sends what is left in the Kafka buffer (up to 30 s), then exits. A SIGTERM during start-up follows the same steps.
+- (0.2.0+) A new connection from a router that is already connected replaces the old one; the old one is closed and the log says `conn <ip>: new connection replaces the old one (closed)`. Messages the old connection had already read are dropped. If this line repeats, the router probably has two BMP sessions to this collector.
 
 ### 6.4 Forwarding rules (unicast_prefix only; router / peer messages are always sent)
 - Order: **peer rule -> router rule -> default**. A value is a list of topic names (each starting with `unicast_prefix`; the real topic is `<prefix>.<name>`, created on first use).
@@ -269,6 +287,31 @@ Rules file format:
 - When a router connects: Initiation -> Peer Up (per neighbor) -> full table -> EoR.
 - Prefix counts are exact from the first full table after Peer Up. A restart forgets previous state (list of down peers, per-minute statistics).
 - Consumers see lag build up during a resync. Inform consumer owners before restarting.
+- From 0.2.0 a new release is installed without a restart (6.8). A restart (resync) is only needed when the hitless upgrade cannot be used (upgrading from 0.1, a release with a new state format, a new listen address).
+
+### 6.8 Hitless upgrade (0.2.0+, `bongsudae -upgrade`)
+The router TCP sessions and all state are handed over to the new binary, so routers do not reconnect (no resync, no consumer lag).
+Like nginx's binary upgrade: **the same pid** execs the new file, so for systemd nothing happens (it is not a restart).
+
+| Step | Old process | New process |
+|---|---|---|
+| 1 | Checks the new binary: `-handover-check` (same state format), `-t` (accepts the current config). Stops here if not | |
+| 2 | Pause: stops accepting and stops reading from every router at a message boundary (bytes of a half-read message are handed over). Routers wait on TCP | |
+| 3 | Flushes everything pending to Kafka | |
+| 4 | Writes the state file `<lock file without .lock>.state` (e.g. `run/bongsudae.state`): routers / peers (Add-Path, negotiated families, EoR, history ...), row sequence number, connections (fd, number, pending bytes), 1-minute statistics, route tables | |
+| 5 | exec (same pid, same options + `-resume <state file>`) | Reads the config and rules files again, connects to Kafka, restores routers / peers |
+| 6 | | Takes the connections over and continues reading from the pending bytes = **end of the pause** |
+| 7 | | Loads the route tables in the background. UPDATEs arriving meanwhile are queued per peer and applied after its table is loaded. The state file is removed at the end |
+
+- Pause: about 0.4 s with 8 million routes (test); 5.5 to 6.4 s with a full table of 77 million routes (2.4 GB state file). Mostly step 4 (about 4 s writing the route tables) and the start of the new process (about 2 s, Kafka connection etc.)
+- Kafka output does not depend on the route tables, so it does not wait for step 7. During step 7 (about 9 s at full size) route counts and prefix lookups are incomplete (`handover.rib_loading` in `/api/stats`)
+- Row sequence numbers and peer / router message numbers continue. No extra router / peer messages are sent (consumers see nothing)
+- On failure in steps 1 to 5 (including a failed exec) the old process simply continues reading the paused connections (log `handover: aborted ...`, `handover.last_error` in `/api/stats`).
+  If the new process cannot read the state after exec, it exits and systemd starts it again: the sessions drop and routers reconnect (the same as a restart, never worse)
+- Configuration: the new process reads the config file from scratch, so "restart" keys change too. Exception: `bmp.listen` and `http.listen` keep the inherited sockets (a restart is needed; one log line).
+  Do not change `kafka.prefix`, `kafka.key_buckets` or `bmp.chash` together with an upgrade (topics / keys would change for consumers mid-stream)
+- The process handing over must already have this feature: upgrading from 0.1 to 0.2.0 is the last ordinary restart. Refused while the route tables of the previous handover are still loading (about a minute)
+- Test: `tools/handover_test.sh` (test port 15000; 25 fake routers keep sending while the collector is upgraded again and again; the Kafka output is compared row by row with a single uninterrupted run)
 
 ### 6.6 Reloading configuration (`systemctl reload bongsudae`)
 Re-reads the config file and the rules file while running (not a restart: connections and the routing table stay).
@@ -289,10 +332,15 @@ Re-reads the config file and the rules file while running (not a restart: connec
 | Needs restart | Why |
 |---|---|
 | `bmp.listen`, `http.listen` | The socket must be re-opened |
-| `kafka.brokers`, `kafka.prefix`, `bmp.chash` | Changing destination or hashes would confuse consumers |
+| `kafka.brokers`, `kafka.prefix`, `kafka.key_buckets`, `kafka.format`, `bmp.chash` | Changing destination, keys, format or hashes would confuse consumers |
 | `paths.*` | Moving files while running is risky |
 
 ---
+
+### 6.7 (removed) (prefix -> origin AS) file export
+
+Briefly present in 0.2.0 development builds, removed before release. A leftover `[export]` section in the config file is accepted and ignored (one log line per key: `config line N : [export] <key> ignored (...)`); delete it from the file.
+The same data can be built from the route list API (`/api/routers/{ip}/prefixes?format=text`, origin_as column).
 
 ## 7. Kafka output (details: docs/kafka.md)
 
@@ -303,7 +351,7 @@ Re-reads the config file and the rules file while running (not a restart: connec
 | `<prefix>.router` | Router init / term (12 fields) | router hash |
 | `<prefix without .parsed>.bmp_raw` (default `openbmp.bmp_raw`) | Received BMP unchanged (`bmp.raw`, production mode only) | router hash |
 
-- Message = header (`V: 1.7`, `C_HASH_ID`, `T`, `L`, `R`) + empty line + rows. bmp_raw headers are `V`, `C_HASH_ID`, `R_HASH`, `R_IP`, `L`.
+- Message = header (`V: 1.7`, `C_HASH_ID`, `T`, `L`, `R`) + empty line + rows; with `kafka.format = json`, one JSON object per line and no header (kafka.md 2.1). bmp_raw headers are `V`, `C_HASH_ID`, `R_HASH`, `R_IP`, `L`.
 - **Same key = same partition = order preserved**: unicast_prefix and peer messages for one neighbor arrive in the order sent. There is no ordering across topics.
 - Unlike openbmpd, bmp_raw also carries messages that failed to parse, and forwarding rules do not apply to it.
 - Forwarding rules can send unicast_prefix rows to other topics, or not at all (6.4).
@@ -320,6 +368,7 @@ Re-reads the config file and the rules file while running (not a restart: connec
 | Task | Endpoint |
 |---|---|
 | Health (per-minute stats for 60 minutes, release / version, memory, Kafka) | `GET /api/stats` |
+| Prometheus | `GET /metrics` (the same numbers in the Prometheus text format, api.md section 2) |
 | Routers / peers | `GET /api/routers`, `/api/routers/{ip}`, `/api/peers`, `/api/routers/{ip}/peers/{peer}` |
 | Route lists | `GET /api/routers/{ip}/peers/{peer}/prefixes`, `/api/routers/{ip}/prefixes` (`?format=text`, `?distinct=1`) |
 | Prefix / address lookup | `GET /api/prefix?p=...&match=exact\|longest\|covering\|more`, `/api/routers/{ip}/prefix` |
@@ -352,27 +401,35 @@ Resyncing a single BGP neighbor is not possible through BMP (BMP is one-way); us
 Bongsudae logs to standard output / error with microsecond timestamps. Under systemd this goes to the journal (`journalctl -u bongsudae`)
 or to the file named in `StandardOutput=append:`; in the latter case rotate it with `copytruncate`.
 
-In release 0.1 some log messages are in Korean. The table lists the fixed parts of each line.
+The table lists the fixed parts of each line.
 
 | When | Line (example) | Meaning |
 |---|---|---|
-| start | `설정 /etc/bongsudae/bongsudae.conf : paths.rules=... bmp.allow=...` | Config file read and values applied (a key overridden on the command line shows `(명령줄 -option)` = "command line") |
-| start | `start bongsudae 0.1 (<rev>) input=tcp prefix=openbmp.parsed http="127.0.0.1:5001" rules=...` | Release, git revision, input, topics, API, rules file |
+| start | `config /etc/bongsudae/bongsudae.conf : paths.rules=... bmp.allow=...` | Config file read and values applied (a key overridden on the command line shows `(command line -option)`) |
+| start | `start bongsudae 0.2.0 (<rev>) input=tcp prefix=openbmp.parsed http="127.0.0.1:5001" rules=...` | Release, git revision, input, topics, API, rules file |
 | start | `rules: default unicast_prefix, routers 0` | Rules loaded |
 | start | `http api ...`, `bmp_raw -> openbmp.bmp_raw`, `listen :5000 allow [192.0.2.0/24]` | Listening addresses, allowed ranges |
-| start | `lock ... : 이미 돌고 있음 (pid N), 끝남` | Another instance holds the lock ("already running, exiting"); systemd retries every `RestartSec` |
+| start | `lock ... : already running (pid N), exiting` | Another instance holds the lock; systemd retries every `RestartSec` |
 | connection | `conn 192.0.2.20: initiation` / `conn ... closed after N msgs: ...` | Router connected / disconnected |
 | connection | `conn ...: first message type N (not initiation), drop`, `too many connections, drop ...` | Closed by protection (6.1) |
 | processing | `router ...: peer_up ... without OPEN (RFC 7854 violation) ...` | Router violates the standard; the message is still processed |
 | every minute | `stat routers=3 route_mon=47346 errors=0 add=63722 del=11101 msgs=47346 ... raw=47344 kafka_fail=0 topics: unicast_prefix=47343/74820` | See the table below |
-| Kafka | `... : N 번 (지난 1 분)` | Kafka error summary: N times in the last minute (one line per error type) |
-| Kafka | `kafka 보내기가 2m0s 넘게 안 됨 : 끝냄 (systemd 가 다시 띄움)` | No successful produce for 2 minutes, exiting (6.3) |
-| API | `reset: router ... closed (from ... actor=...)`, `rules: ... (from ... actor=...)`, `rules: key 틀림 ...` | Who changed what / wrong key |
-| reload | `설정 다시 읽음 (..., SIGHUP) : bmp.allow "..." -> "..." (빠진 라우터 연결 N 개 끊음)` | Config reloaded: changed keys (N connections of removed routers closed) |
-| reload | `설정 다시 읽음 : 재시작해야 바뀌는 항목 (지금 값 유지) : ...` | Restart-only keys changed; current values kept |
-| reload | `설정 다시 읽기 실패, 지금 값 유지 : ...` | Config reload failed; nothing changed |
-| reload | `rules reload (SIGHUP): N 바뀜` / `rules   ...` | Rules file re-read: N changes, then the changed rules |
-| stop | `signal terminated: flush and exit` | stop / restart |
+| Kafka | `... : N times (last minute)` | Kafka error summary: N times in the last minute (one line per error type) |
+| Kafka | `kafka produce failing for more than 2m0s : exiting (systemd restarts)` | No successful produce for 2 minutes, exiting (6.3) |
+| API | `reset: router ... closed (from ... actor=...)`, `rules: ... (from ... actor=...)`, `rules: wrong key ...` | Who changed what / wrong key |
+| reload | `config reloaded (..., SIGHUP) : bmp.allow "..." -> "..." (closed N connections of removed routers)` | Config reloaded: changed keys (N connections of removed routers closed) |
+| reload | `config reloaded : restart needed for (running values kept) : ...` | Restart-only keys changed; current values kept |
+| reload | `config reload failed, running values kept : ...` | Config reload failed; nothing changed |
+| reload | `rules reload (SIGHUP): N changed` / `rules   ...` | Rules file re-read: N changes, then the changed rules |
+| Kafka | `kafka topic ... : unknown topic (deleted / re-created?), re-reading topic metadata` (shadow: `re-subscribing`) | A topic was re-created; recovered without restart (6.3) |
+| stop | `signal : stop accepting, close router connections`, `shutdown : N router connections closed`, `shutdown : flush kafka and exit` | stop / restart |
+| conn | `conn <ip>: new connection replaces the old one (closed)` | A new connection from the same router replaced the old one |
+| upgrade | `handover: start (SIGUSR2), checking /var/lib/bongsudae/bongsudae` | Old process: start (6.8) |
+| upgrade | `handover: paused 25 connections in 4ms, kafka flushed in 1ms, state run/bongsudae.state (2434 MB, 76937952 routes) written in ...: exec ...` | Old process: paused, flushed, state written, now exec |
+| upgrade | `start bongsudae 0.2.1 (...) (handover) ...` then `handover: resumed from 0.2.0 ... : 25 connections, 25 routers, 1331 peers, routers paused ...` | New process: took over, how long routers were paused |
+| upgrade | `handover: route tables loaded : N routes in ...` | New process: route tables loaded |
+| upgrade | `handover: aborted, old process keeps running : ...` | Gave up, the old process keeps running. Reason: new binary check, connections that did not pause, Kafka, state file, exec |
+| upgrade | `handover: bmp.listen ... ignored, keeping the inherited socket (needs a restart)` | The listen address in the config changed: only a restart changes it |
 
 **Per-minute statistics (`stat`)**: zero values are omitted.
 
@@ -403,8 +460,8 @@ In release 0.1 some log messages are in Korean. The table lists the fixed parts 
 | Allow a new API client | Firewall for the API port; if `http.allow` is used, add it there too and reload |
 | Send routes to other topics / not at all | Forwarding rules (6.4, 8.3) |
 | Resync one router | `bongsudae -post routers <ip> reset` (once per 10 minutes) |
-| Upgrade | Test the new build (`go test .`, a shadow run, or file mode on a bmp_raw dump, comparing output with the old release) -> inform consumers -> keep the old binary (e.g. `bongsudae.prev`) -> install the new binary -> `sudo systemctl restart bongsudae` |
-| Roll back | Put the previous binary back and `sudo systemctl restart bongsudae` |
+| Upgrade | Test the new build (`go test .`, a shadow run, or file mode on a bmp_raw dump, comparing output with the old release; `tools/handover_test.sh`) -> inform consumers -> keep the old binary (e.g. `bongsudae.prev`) -> install the new binary at the same path -> **`bongsudae -upgrade`** (0.2.0+, 6.8, no sudo needed). Only when 0.1 is running: `sudo systemctl restart bongsudae` |
+| Roll back | Put the previous binary back and `bongsudae -upgrade` (if it uses the same state format), otherwise `sudo systemctl restart bongsudae` |
 | Test a new release in shadow | `./bongsudae.new -input kafka -prefix openbmp.test -group bmp-test-NAME -http 127.0.0.1:5003` (next to production, writing to test topics), then compare its topics with production |
 | Test the API on a full table | `bongsudae -input file -in <bmp_raw dump> -out none -http 127.0.0.1:5002` |
 
@@ -419,16 +476,18 @@ Notes on the shadow run:
 
 | Symptom | Where to look / what to do |
 |---|---|
-| Does not start | `systemctl status bongsudae` and the log: config error (line number), `-http ...: address already in use` (another process holds the API port), `lock ... 이미 돌고 있음` (an instance started by hand is running) |
+| Does not start | `systemctl status bongsudae` and the log: config error (line number), `-http ...: address already in use` (another process holds the API port), `lock ... already running` (an instance started by hand is running) |
 | A router does not connect | Router BMP config, firewall port 5000, `bmp.allow` (outside = closed without a log line; the default allows only localhost), `first message type` in the log |
 | `routers=` drops | `conn ... closed after` in the log (router restart / link). When it reconnects, only that router resyncs |
 | `errors=` is not 0 | `router ...: ...` lines in the log (up to 100 per router per minute). Only that message is dropped. Reproduce with file mode from a bmp_raw dump |
 | `kafka_fail=` is not 0 | Kafka status and the Kafka summary lines. After 2 minutes without success Bongsudae restarts itself |
-| Low prefix count / `synced` false | Shortly after start a resync is still running. A neighbor that never sends EoR is never marked synced (its routes still arrive) |
+| Low prefix count / `synced` false | Shortly after start a resync is still running. A neighbor that never sends EoR is never marked synced (its routes still arrive); look at `settled` (no new prefix for 5 minutes) |
 | Large consumer lag | Normal right after a resync. If it stays high, check the consumers |
 | API 403 | Client outside `http.allow`, or wrong / missing key (the body gives the reason) |
 | API 409 | The rules file was edited by hand and not reloaded -> run `bongsudae -reload` first |
 | API 429 | Reset of the same router again within 10 minutes (see `Retry-After`) |
+| `-upgrade` says `aborted` | The reason is printed (also `handover.last_error` in `/api/stats` and the log). The old process keeps running. If the new binary failed `-handover-check` / `-t`, fix that binary; `still loading` = try again in a minute |
+| `-upgrade` says `cannot hand over` | The running release is 0.1 (no hitless upgrade): restart once with `sudo systemctl restart bongsudae` |
 | Memory | See 6.2. If systemd `MemoryMax=` is exceeded the process is killed and restarted (= resync) |
 
 ---
@@ -446,8 +505,14 @@ Notes on the shadow run:
 | `bmp.chash` | `-chash` | restart |
 | `kafka.brokers` | `-kafka` | restart |
 | `kafka.prefix` | `-prefix` | restart |
+| `kafka.key_buckets` | `-key-buckets` | restart |
+| `kafka.format` | `-format` | restart |
+| `kafka.partitions` | `-partitions` | restart |
+| `kafka.replication` | `-replication` | restart |
+| `kafka.retention` | `-retention` | restart |
+| `bmp.rib` | `-rib` | restart |
 | `http.listen` | `-http` | restart |
 | `http.allow` | `-http-allow` | live |
 
 Command-line only options: `-c`, `-input`, `-src`, `-group`, `-from-start`, `-in`, `-out`, `-t`,
-`-status`, `-set`, `-del`, `-post`, `-reload`, `-topics`, `-json`, `-api`.
+`-status`, `-set`, `-del`, `-post`, `-reload`, `-topics`, `-json`, `-api`, `-upgrade`, `-resume`, `-handover-check`.

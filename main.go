@@ -37,55 +37,82 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 )
 
 // 옵션 (C 의 전역 설정 구조체와 같음)
 var (
-	optConf   = flag.String("c", "", "설정 파일 (-input tcp 와 API 명령만). 빈 값 = "+defConfig+" 가 있으면 그것. 명령줄 옵션이 설정 파일보다 우선")
-	optInput  = flag.String("input", "tcp", "입력 : tcp | kafka | file")
-	optListen = flag.String("listen", ":5000", "tcp : 받을 주소")
-	optAllow  = flag.String("allow", "127.0.0.1,::1", "tcp : 허용 주소 / 대역 (쉼표 구분). 라우터 loopback 대역을 적음")
-	optKafka  = flag.String("kafka", "127.0.0.1:9092", "Kafka 주소")
-	optPrefix = flag.String("prefix", "openbmp.parsed", "출력 토픽 앞부분 (<prefix>.unicast_prefix / .router / .peer). 시험은 openbmp.test")
-	optSrc    = flag.String("src", "openbmp.bmp_raw", "kafka : 읽을 토픽")
-	optGroup  = flag.String("group", "bmp-test-shadow", "kafka : consumer group")
-	optStart  = flag.Bool("from-start", false, "kafka : 새 group 이면 토픽 처음부터 (재생 시험용, 기본은 지금부터)")
-	optRaw    = flag.Bool("raw", true, "tcp : 받은 BMP 를 그대로 <prefix 에서 .parsed 뺀 것>.bmp_raw 로 (openbmp.parsed -> openbmp.bmp_raw)")
-	optCHash  = flag.String("chash", "", "tcp : 메시지 머리 C_HASH_ID (32 자리 16 진수). 빈칸 = md5(호스트 이름) (openbmpd 기본 admin_id 와 같은 방식)")
-	optLock   = flag.String("lock", "", "잠금 파일 (이미 돌고 있으면 기록 한 줄 남기고 끝남 : 둘이 뜨지 않게)")
-	optIn     = flag.String("in", "", "file : bmp_raw 덤프 파일")
-	optOut    = flag.String("out", "", "file : 출력 덤프 파일 앞부분 (<out>.unicast_prefix.dump 등), none = 버림")
-	optTest   = flag.Bool("t", false, "설정만 검사하고 끝남")
-	optHTTP   = flag.String("http", "", "웹 API 주소 : 127.0.0.1:5001 (로컬) | :5001 (글로벌, 접근 제어는 방화벽) | 빈칸 (끔)")
-	optHTTPOK = flag.String("http-allow", "", "웹 API 허용 주소 / 대역 (쉼표 구분), 밖이면 403. 빈칸 = 모두 (방화벽만)")
-	optRules  = flag.String("rules", "conf/kafka_rules.json", "Kafka 전달 규칙 파일 (시작할 때 읽음, API 로 바꿀 때 씀)")
-	optToken  = flag.String("token", "conf/api_token", "규칙 변경 key 파일 (서버 : 검사, -set / -del / -reload : 보냄)")
+	optConf      = flag.String("c", "", "config file (-input tcp and API commands only). Empty = "+defConfig+" if it exists. Command line options win")
+	optInput     = flag.String("input", "tcp", "input : tcp | kafka | file")
+	optListen    = flag.String("listen", ":5000", "tcp : listen address for BMP")
+	optAllow     = flag.String("allow", "127.0.0.1,::1", "tcp : allowed routers, addresses / prefixes (comma separated), e.g. the loopback range")
+	optKafka     = flag.String("kafka", "127.0.0.1:9092", "Kafka bootstrap servers")
+	optPrefix    = flag.String("prefix", "openbmp.parsed", "output topic prefix (<prefix>.unicast_prefix / .router / .peer). Tests : openbmp.test")
+	optSrc       = flag.String("src", "openbmp.bmp_raw", "kafka : topic to read (bmp_raw)")
+	optGroup     = flag.String("group", "bmp-test-shadow", "kafka : consumer group")
+	optStart     = flag.Bool("from-start", false, "kafka : a new group starts at the beginning of the topic (replay tests; default = now)")
+	optBucket    = flag.Int("key-buckets", 0, "unicast_prefix Kafka key : 0 = peer hash (one message per UPDATE), N = split rows into N buckets by prefix, key <peer hash>.<bucket> (spreads a big peer over partitions)")
+	optParts     = flag.Int("partitions", 8, "partitions of topics the collector creates (existing topics are not changed)")
+	optRepl      = flag.Int("replication", 1, "replication factor of topics the collector creates")
+	optRetention = flag.Duration("retention", 90*time.Minute, "retention (retention.ms) of topics the collector creates")
+	optFormat    = flag.String("format", "openbmp", "Kafka message format of unicast_prefix / router / peer : openbmp (v1.7, tab separated) or json (one JSON object per line). bmp_raw is unchanged")
+	optRIB       = flag.Bool("rib", true, "keep per-peer route tables in memory (route counts, prefix lookup API). false = forward only, much less memory")
+	optRaw       = flag.Bool("raw", true, "tcp : forward received BMP unchanged to <prefix without .parsed>.bmp_raw (openbmp.parsed -> openbmp.bmp_raw)")
+	optCHash     = flag.String("chash", "", "tcp : C_HASH_ID in message headers (32 hex digits). Empty = md5(host name), like openbmpd without admin_id")
+	optLock      = flag.String("lock", "", "lock file (if another instance holds it : log one line and exit)")
+	optIn        = flag.String("in", "", "file : bmp_raw dump file to read")
+	optOut       = flag.String("out", "", "file : output dump file prefix (<out>.unicast_prefix.dump ...), none = discard")
+	optTest      = flag.Bool("t", false, "check the configuration and rules, then exit")
+	optHTTP      = flag.String("http", "", "HTTP API address : 127.0.0.1:5001 (local) | :5001 (all, use -http-allow / firewall) | empty (off)")
+	optHTTPOK    = flag.String("http-allow", "", "HTTP API allowed clients, addresses / prefixes (comma separated), others get 403. Empty = everyone")
+	optRules     = flag.String("rules", "conf/kafka_rules.json", "Kafka forwarding rules file (read at start and on reload, written on API changes)")
+	optToken     = flag.String("token", "conf/api_token", "API key file for changes (server : checks it, -set / -del / -post / -reload : send it)")
 
 	// 웹 API 를 부르는 명령 (status.go) : 인자 = API 경로 (/api/ 뒤), 이름=값 = 질의
 	optStatus = flag.Bool("status", false, "GET    : -status routers 192.0.2.100 peers 198.51.100.33")
 	optSet    = flag.Bool("set", false, "PUT    : -set -topics a,b|none kafka rules routers IP [peers PEER]")
 	optDel    = flag.Bool("del", false, "DELETE : -del kafka rules routers IP [peers PEER]")
-	optPost   = flag.Bool("post", false, "POST   : -post routers IP reset (BMP 세션 끊기), -post kafka rules reload")
-	optReload = flag.Bool("reload", false, "POST   : 규칙 파일을 다시 읽게 함 (= -post kafka rules reload)")
-	optTopics = flag.String("topics", "", "-set : 토픽 이름 (쉼표 구분), none = 보내지 않음")
-	optJSON   = flag.Bool("json", false, "표 대신 받은 JSON 그대로")
-	optAPI    = flag.String("api", "http://127.0.0.1:5001", "웹 API 주소 (다른 서버의 collector 도)")
+	optPost   = flag.Bool("post", false, "POST   : -post routers IP reset (close the BMP session), -post kafka rules reload")
+	optReload = flag.Bool("reload", false, "POST   : reload the rules file (= -post kafka rules reload)")
+	optTopics = flag.String("topics", "", "-set : topic names (comma separated), none = do not send")
+	optJSON   = flag.Bool("json", false, "print the JSON as received instead of a table")
+	optAPI    = flag.String("api", "http://127.0.0.1:5001", "HTTP API base URL (also of a collector on another server)")
+
+	// 무중단 판 올리기 (handover.go)
+	optUpgrade = flag.Bool("upgrade", false, "hand the running collector (pid in the lock file) over to the binary now at its path, without dropping router sessions (SIGUSR2)")
+	optResume  = flag.String("resume", "", "internal : state file from the old process (set by the handover exec)")
+	optHOCheck = flag.Bool("handover-check", false, "internal : print the handover state format and exit")
 )
 
 // confApplied : 시작 때 설정 파일에서 넣은 항목 (기록용)
 var confApplied []string
 
+// resumeState : 판 올리기로 시작했으면 옛 판의 상태 (handover.go), 아니면 nil
+var resumeState *handoverState
+
 func main() {
 	flag.Parse()
+	if *optHOCheck {
+		handoverCheck()
+		return
+	}
+	exePath, _ = os.Executable() // 판 올리기 : 같은 경로의 (새) 파일을 exec
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 	if *optInput == "tcp" { // 운영 / API 명령. 시험 입력 (kafka, file) 은 설정 파일을 읽지 않음 (운영 값이 섞이지 않게)
 		var err error
 		if confApplied, err = loadConfig(*optConf); err != nil {
-			fmt.Fprintln(os.Stderr, "설정 파일 :", err)
+			fmt.Fprintln(os.Stderr, "config file :", err)
 			os.Exit(1)
 		}
 	} else if *optConf != "" {
-		log.Fatalf("-c 는 -input tcp 에서만 (지금 -input %s)", *optInput)
+		log.Fatalf("-c only with -input tcp (now -input %s)", *optInput)
+	}
+	if *optUpgrade {
+		if err := runUpgrade(*optAPI); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
 	}
 	if *optStatus || *optSet || *optDel || *optPost || *optReload {
 		if err := runClient(*optAPI, flag.Args()); err != nil {
@@ -105,15 +132,25 @@ func main() {
 			log.Fatal(err)
 		}
 		if confPath != "" {
-			fmt.Printf("ok (설정 %s : %s)\n", confPath, strings.Join(confApplied, ", "))
+			fmt.Printf("ok (config %s : %s)\n", confPath, strings.Join(confApplied, ", "))
 		}
 		fmt.Printf("ok (rules %s : default %s, routers %d)\n", *optRules, topicsText(rl.set.Default), len(rl.set.Routers))
 		return
 	}
-	if *optLock != "" && !lock(*optLock) {
+	if *optResume != "" { // 판 올리기로 시작 : 잠금은 옛 판의 fd 를 그대로 (같은 프로세스)
+		if *optInput != "tcp" {
+			log.Fatal("-resume only with -input tcp")
+		}
+		hs, err := readHandover(*optResume)
+		if err != nil {
+			log.Fatalf("handover: %v (exiting : routers reconnect)", err)
+		}
+		resumeState = hs
+		lockFile = fileFd(hs.LockFd, *optLock)
+	} else if *optLock != "" && !lock(*optLock) {
 		// 다른 것이 이미 돌고 있음. systemd 에서는 이 줄이 "되풀이 재시작" 을 알려 줌 (cron 때는 조용히 끝났음)
 		pid, _ := os.ReadFile(*optLock)
-		log.Printf("lock %s : 이미 돌고 있음 (pid %s), 끝남", *optLock, strings.TrimSpace(string(pid)))
+		log.Printf("lock %s : already running (pid %s), exiting", *optLock, strings.TrimSpace(string(pid)))
 		return
 	}
 	if err := run(); err != nil {
@@ -126,20 +163,29 @@ func checkOpts() error {
 	if _, err := parseHTTPAllow(*optHTTPOK); err != nil {
 		return fmt.Errorf("-http-allow : %w", err)
 	}
+	if *optParts < 1 || *optParts > 1000 || *optRepl < 1 || *optRepl > 10 || *optRetention < time.Minute {
+		return fmt.Errorf("-partitions 1 to 1000, -replication 1 to 10, -retention at least 1m")
+	}
+	if *optFormat != "openbmp" && *optFormat != "json" {
+		return fmt.Errorf("-format %q : openbmp or json", *optFormat)
+	}
+	if *optBucket < 0 || *optBucket > maxKeyBuckets {
+		return fmt.Errorf("-key-buckets %d : 0 to %d", *optBucket, maxKeyBuckets)
+	}
 	switch *optInput {
 	case "tcp":
 		_, err := parseAllow(*optAllow)
 		return err
 	case "kafka":
 		if *optPrefix == "openbmp.parsed" || *optPrefix == "openbmp" {
-			return fmt.Errorf("-input kafka 는 운영 토픽에 쓸 수 없음 (-prefix %s) : -prefix openbmp.test 처럼 시험 토픽을 적음", *optPrefix)
+			return fmt.Errorf("-input kafka cannot write production topics (-prefix %s) : use a test prefix such as -prefix openbmp.test", *optPrefix)
 		}
 		if !strings.HasPrefix(*optGroup, "bmp-test-") {
-			return fmt.Errorf("-group 은 bmp-test-* 로 (운영 group 보호)")
+			return fmt.Errorf("-group must be bmp-test-* (protects production groups)")
 		}
 	case "file":
 		if *optIn == "" || *optOut == "" {
-			return errors.New("-input file 은 -in, -out 필요")
+			return errors.New("-input file needs -in and -out")
 		}
 	default:
 		return fmt.Errorf("-input %q ?", *optInput)
@@ -183,9 +229,13 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
 	if confPath != "" {
-		log.Printf("설정 %s : %s", confPath, strings.Join(confApplied, ", "))
+		log.Printf("config %s : %s", confPath, strings.Join(confApplied, ", "))
 	}
-	log.Printf("start bongsudae %s (%s) input=%s prefix=%s http=%q rules=%s", release, version(), *optInput, *optPrefix, *optHTTP, *optRules)
+	how := ""
+	if resumeState != nil {
+		how = " (handover)"
+	}
+	log.Printf("start bongsudae %s (%s)%s input=%s prefix=%s http=%q rules=%s", release, version(), how, *optInput, *optPrefix, *optHTTP, *optRules)
 	rl, err := newRules(*optRules)
 	if err != nil {
 		return err
@@ -208,33 +258,43 @@ func run() error {
 		}
 	}()
 	c := newCollector(collectorHash(*optCHash))
+	c.keyBuckets = *optBucket
+	c.noRIB = !*optRIB
+	c.json = *optFormat == "json"
 	c.rules, c.prefix, c.tokenPath = rl, *optPrefix, *optToken
-	if *optHTTP != "" {
-		if err := startAPI(*optHTTP, c); err != nil {
+	hs := resumeState
+	if hs != nil { // 판 올리기 : 라우터 / peer 를 되살리고 경로표는 뒤에서
+		hs.restore(c)
+		go hs.loadRIBs(c)
+	}
+	if ln := hs.httpListener(); *optHTTP != "" || ln != nil {
+		if err := startAPI(*optHTTP, c, ln); err != nil {
 			return err
 		}
 	}
 	if *optInput == "kafka" {
 		return runKafka(ctx, *optKafka, *optSrc, *optGroup, c, out)
 	}
-	// signal 은 따로 받음 : ctx 는 run 이 오류로 돌아올 때 (defer stop) 도 끝나므로, ctx 로 기다리면
-	// listen 실패 같은 오류가 "signal" 로 기록되고 exit 0 이 됨 (10-30 교체 때 봄)
-	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, syscall.SIGTERM, syscall.SIGINT)
-	go func() {
-		s := <-sig
-		log.Printf("signal %v: flush and exit", s)
-		out.close()
-		os.Exit(0)
-	}()
 	if *optRaw {
 		if err := out.enableRaw(*optPrefix); err != nil {
 			return err
 		}
 		log.Printf("bmp_raw -> %s", out.rawTopic)
 	}
+	// kill -USR2 (= bongsudae -upgrade) : 무중단 판 올리기 (handover.go). 등록하지 않으면 USR2 에 프로세스가 끝남
+	usr2 := make(chan os.Signal, 1)
+	signal.Notify(usr2, syscall.SIGUSR2)
+	go func() {
+		for range usr2 {
+			upg.upgrade()
+		}
+	}()
 	allow, _ := parseAllow(*optAllow)
-	return runTCP(*optListen, allow, c, out)
+	if err := runTCP(ctx, *optListen, allow, c, out, hs); err != nil {
+		return err
+	}
+	log.Printf("shutdown : flush kafka and exit") // 연결은 정리됨. Flush 는 run 의 defer out.close()
+	return nil
 }
 
 // addConfHooks : reload 로 바로 바뀌는 설정 (config.go). 나머지 항목은 재시작해야 바뀜
@@ -246,7 +306,7 @@ func addConfHooks(out *producer) {
 			tcpAllow.Store(&list)
 			if ct := tcpConns.Load(); ct != nil {
 				if n := ct.closeOutside(list); n > 0 {
-					return fmt.Sprintf("빠진 라우터 연결 %d 개 끊음", n)
+					return fmt.Sprintf("closed %d connections of removed routers", n)
 				}
 			}
 			return ""
@@ -287,10 +347,10 @@ func serveFile(c *collector) error {
 		return err
 	}
 	c.rules, c.tokenPath = rl, ""
-	if err := startAPI(*optHTTP, c); err != nil {
+	if err := startAPI(*optHTTP, c, nil); err != nil {
 		return err
 	}
-	log.Printf("file done : API %s 열어 둠 (끝내려면 kill / Ctrl-C)", *optHTTP)
+	log.Printf("file done : API %s stays open (kill / Ctrl-C to stop)", *optHTTP)
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
 	<-ctx.Done()
@@ -344,6 +404,9 @@ func runFile(inPath, outPrefix string) (*collector, error) {
 		}
 		if c == nil {
 			c = newCollector(raw.cHash)
+			c.keyBuckets = *optBucket
+			c.noRIB = !*optRIB
+			c.json = *optFormat == "json"
 		}
 		for _, m := range c.handle(raw.routerIP, raw.routerHash, raw.body, d.ts) {
 			writeDump(outs[m.kind], &dumpRecord{offset: offset[m.kind], ts: d.ts, key: []byte(m.key), value: m.value})

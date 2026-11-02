@@ -58,3 +58,12 @@ func (s *stats) addAll(o *stats) {
 	s.noOpen += o.noOpen
 	s.dropped += o.dropped
 }
+
+// bmpTotal : 받은 BMP 메시지 수 (종류 모두)
+func (s *stats) bmpTotal() int {
+	n := 0
+	for _, v := range s.bmpType {
+		n += v
+	}
+	return n
+}

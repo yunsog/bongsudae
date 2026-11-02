@@ -17,6 +17,8 @@ allow  = 203.0.113.0/24,
 
          192.0.2.0/24
 raw    = false
+[export]                # 없앤 구역 : 받고 무시
+origins = true
 [http]
 allow  =
 `

@@ -86,13 +86,18 @@ const histMax = 10 // peer 마다 남기는 이력 수
 
 // peer : 라우터 하나의 peer 하나 (down 이 되어도 목록에 남음, collector 를 다시 시작하면 잊음)
 type peer struct {
-	key   string // peer hash
-	ip    netip.Addr
-	rd    string
-	typ   uint8 // per-peer 머리 종류 (0 global, 1 rd, 2 local, 3 loc-rib)
-	flags uint8
-	as    uint32
-	bgpID string
+	key      string // peer hash
+	ip       netip.Addr
+	ipStr    string // ip 글자 (줄마다 쓰므로 한 번만 만듦)
+	rd       string
+	typ      uint8 // per-peer 머리 종류 (0 global, 1 rd, 2 local, 3 loc-rib)
+	flags    uint8
+	as       uint32
+	bgpID    string
+	bgpIDRaw [4]byte // bgpID 의 바이트 (바뀌었는지 보려고)
+
+	bmpStats   map[string]uint64 // 마지막 BMP Stats Report (bmp_stats.go, 0.2.0). nil = 받은 적 없음
+	bmpStatsAt time.Time
 
 	up     bool
 	gotUp  bool // 이번 BMP 세션에서 Peer Up 을 받음 = 경로표가 처음부터 정확
@@ -110,12 +115,24 @@ type peer struct {
 	eorV4, eorV6 time.Time // End-of-RIB 받은 시각 (이번 세션)
 
 	lastUpdate time.Time
+	grewAt     uint32 // 경로표에 새 프리픽스가 마지막으로 들어온 unix 초 (settled, 0.2.0). -rib=false 면 add 를 받은 때
 	adds, dels uint64 // 이번 up 이후 받은 add / del 줄 수
 	downReason string
 	hist       []event
 
 	rib4 map[key4]route
 	rib6 map[key6]route
+
+	// 무중단 판 올리기 (0.2.0, handover.go) 뒤 경로표를 뒤에서 읽는 동안 : 경로표 바꾸기는 ribLog 에 모았다가
+	// 읽은 경로표에 차례로 (ribLoaded). 그 사이 경로표를 비우면 (Peer Up / Down) 기다림을 끝냄 = 읽은 것은 버림
+	ribWait bool
+	ribLog  []ribOp
+}
+
+// ribOp : 경로표를 읽는 동안 미뤄 둔 UPDATE 하나
+type ribOp struct {
+	u *update
+	t uint32
 }
 
 func (p *peer) addEvent(t time.Time, text string) {
@@ -128,7 +145,8 @@ func (p *peer) addEvent(t time.Time, text string) {
 // clearRIB : 경로표를 비움 (nil 로 : 메모리를 돌려줌)
 func (p *peer) clearRIB() {
 	p.rib4, p.rib6 = nil, nil
-	p.adds, p.dels = 0, 0
+	p.ribWait, p.ribLog = false, nil
+	p.adds, p.dels, p.grewAt = 0, 0, 0
 	p.eorV4, p.eorV6 = time.Time{}, time.Time{}
 }
 
@@ -139,6 +157,21 @@ func (p *peer) synced() bool {
 		return false
 	}
 	return (!p.famV4 || !p.eorV4.IsZero()) && (!p.famV6 || !p.eorV6.IsZero())
+}
+
+// settleAfter : Peer Up 뒤 이만큼 새 프리픽스가 늘지 않으면 settled (End-of-RIB 를 BMP 로 안 넘기는 라우터용)
+const settleAfter = 5 * time.Minute
+
+// settled : 처음 전체 전송이 끝난 것으로 봄 = synced (End-of-RIB) 이거나, Peer Up 뒤 settleAfter 가 지났고
+// 그동안 settleAfter 넘게 새 프리픽스가 없음. synced 와 같이 Peer Up 을 받은 up peer 만
+func (p *peer) settled(now time.Time) bool {
+	if p.synced() {
+		return true
+	}
+	if !p.up || !p.gotUp || now.Sub(p.since) < settleAfter {
+		return false
+	}
+	return now.Unix()-int64(p.grewAt) >= int64(settleAfter/time.Second)
 }
 
 // gotEoR : End-of-RIB 를 기록 (처음 한 번만 이력에)
@@ -178,8 +211,31 @@ func attrOf(a *attrs, v4 bool) pathAttr {
 }
 
 // apply : UPDATE 하나를 경로표에
+// countOnly : 경로표 없이 (-rib=false) 수와 시각만
+func (p *peer) countOnly(u *update, now time.Time) {
+	p.adds += uint64(len(u.v4Add) + len(u.v6Add))
+	p.dels += uint64(len(u.v4Del) + len(u.v6Del))
+	p.lastUpdate = now
+	if len(u.v4Add)+len(u.v6Add) > 0 { // 경로표가 없어 새 프리픽스인지 모름 : add 를 받은 때로
+		p.grewAt = uint32(now.Unix())
+	}
+}
+
 func (p *peer) apply(u *update, now time.Time) {
+	p.adds += uint64(len(u.v4Add) + len(u.v6Add))
+	p.dels += uint64(len(u.v4Del) + len(u.v6Del))
+	p.lastUpdate = now
 	t := uint32(now.Unix())
+	if p.ribWait {
+		p.ribLog = append(p.ribLog, ribOp{u, t})
+		return
+	}
+	p.ribApply(u, t)
+}
+
+// ribApply : UPDATE 하나를 경로표에 (t = unix 초)
+func (p *peer) ribApply(u *update, t uint32) {
+	n := len(p.rib4) + len(p.rib6)
 	if len(u.v4Add) > 0 {
 		h := unique.Make(attrOf(&u.attrs, true))
 		if p.rib4 == nil {
@@ -198,27 +254,55 @@ func (p *peer) apply(u *update, now time.Time) {
 			p.rib6[k6(x.addr, x.length)] = route{h, t}
 		}
 	}
+	if len(p.rib4)+len(p.rib6) > n { // 새 프리픽스가 들어옴 (지우기 전에 셈 : settled)
+		p.grewAt = t
+	}
 	for _, x := range u.v4Del {
 		delete(p.rib4, k4(x.addr, x.length)) // nil map 에 delete 는 그냥 지나감
 	}
 	for _, x := range u.v6Del {
 		delete(p.rib6, k6(x.addr, x.length))
 	}
-	p.adds += uint64(len(u.v4Add) + len(u.v6Add))
-	p.dels += uint64(len(u.v4Del) + len(u.v6Del))
-	p.lastUpdate = now
+}
+
+// ribLoaded : 뒤에서 읽은 경로표를 넣고 미뤄 둔 UPDATE 를 차례로 (r.mu 쓰기 잠금 안에서).
+// 기다림이 이미 끝났으면 (그 사이 경로표를 비움) 읽은 것은 버리고 false
+func (p *peer) ribLoaded(rib4 map[key4]route, rib6 map[key6]route) bool {
+	if !p.ribWait {
+		return false
+	}
+	p.rib4, p.rib6 = rib4, rib6
+	for _, op := range p.ribLog {
+		p.ribApply(op.u, op.t)
+	}
+	p.ribWait, p.ribLog = false, nil
+	return true
+}
+
+// peerID : peer 를 찾는 열쇠 = per-peer 머리의 주소 + RD 바이트 (비교 가능한 구조체 = C 의 memcmp 열쇠).
+// peer hash (md5 글자) 는 peer 를 처음 만들 때 한 번만 계산 (0.2.0 : 전에는 메시지마다 두 번)
+type peerID struct {
+	addr netip.Addr
+	rd   [8]byte
 }
 
 // peerGet : per-peer 머리로 peer 를 찾음 (없으면 만듦). AS, BGP ID 는 머리의 최신 값
 func (r *router) peerGet(h *peerHdr) *peer {
-	key := md5hex(h.addr.String(), rdString(h.rd), r.hash)
-	p := r.peers[key]
+	id := peerID{h.addr, h.rd}
+	p := r.byID[id]
 	if p == nil {
-		p = &peer{key: key, ip: h.addr, rd: rdString(h.rd), typ: h.typ}
-		r.peers[key] = p
+		ip, rd := h.addr.String(), rdString(h.rd)
+		key := md5hex(ip, rd, r.hash)
+		if p = r.peers[key]; p == nil {
+			p = &peer{key: key, ip: h.addr, ipStr: ip, rd: rd, typ: h.typ}
+			r.peers[key] = p
+		}
+		r.byID[id] = p
 	}
 	p.flags, p.as = h.flags, h.as
-	p.bgpID = netip.AddrFrom4(h.bgpID).String()
+	if p.bgpID == "" || p.bgpIDRaw != h.bgpID { // 글자는 바뀔 때만 만듦
+		p.bgpIDRaw, p.bgpID = h.bgpID, netip.AddrFrom4(h.bgpID).String()
+	}
 	return p
 }
 

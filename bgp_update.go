@@ -42,7 +42,7 @@ type attrs struct {
 	asPath       string // " 1299 3257 { 1 2 }" (AS 마다 앞 공백)
 	asCount      int    // 경로 길이 (RFC 4271 : AS_SET = 1, CONFED = 0)
 	originAS     uint32 // 마지막 AS_SEQUENCE 의 마지막 AS (경로가 AS_SET 으로 끝나면 0)
-	originSet    string // 경로가 AS_SET 으로 끝나면 그 묶음 "{38266,45271}" (origin_as 칸에 이것)
+	originSet    string // 경로가 AS 둘 이상인 AS_SET 으로 끝나면 그 묶음 "{38266,45271}" (origin_as 칸에 이것)
 	segs         []asSeg
 	nextHop      string // NEXT_HOP (IPv4)
 	mpNextHop    string // MP_REACH 의 next hop
@@ -139,6 +139,9 @@ func parseNLRI(b []byte, afi int, addPath bool) ([]prefix, error) {
 		}
 		var a [16]byte
 		copy(a[:], b[1:1+nb])
+		if r := p.length % 8; r != 0 { // 길이 뒤의 남는 비트는 무시 (RFC 4271 4.3 "trailing bits") : 0 으로
+			a[nb-1] &= 0xff << (8 - r) // 예 /23 에 10.1.1 이 와도 10.1.0.0/23
+		}
 		if afi == afiIPv6 {
 			p.addr = netip.AddrFrom16(a)
 		} else {
@@ -152,7 +155,8 @@ func parseNLRI(b []byte, afi int, addPath bool) ([]prefix, error) {
 
 // parseAttrs : 속성 = flag 1 + 종류 1 + 길이 (1 또는 extended 면 2) + 값
 func parseAttrs(b []byte, o pathOpts, u *update) error {
-	var as4path []byte // 2 바이트 AS peer 의 AS4_PATH (나중에 합침)
+	var as4path []byte     // 2 바이트 AS peer 의 AS4_PATH (나중에 합침)
+	var agg, as4agg []byte // AGGREGATOR, AS4_AGGREGATOR 의 값 (2 바이트 AS peer 규칙에 씀)
 	for len(b) > 0 {
 		if len(b) < 3 {
 			return fmt.Errorf("attr: %w", errShort)
@@ -170,18 +174,48 @@ func parseAttrs(b []byte, o pathOpts, u *update) error {
 		}
 		v := b[hl : hl+n]
 		b = b[hl+n:]
-		if typ == attrAS4Path {
+		switch typ {
+		case attrAS4Path:
 			as4path = v
 			continue
+		case attrAS4Agg:
+			as4agg = v
+			continue
+		case attrAggregator:
+			agg = v // 아래 parseAttr 도 함 (글자)
 		}
 		if err := parseAttr(typ, v, o, u); err != nil {
 			return fmt.Errorf("attr %d: %w", typ, err)
 		}
 	}
-	if as4path != nil && !o.as4 {
-		mergeAS4Path(as4path, &u.attrs)
+	if !o.as4 {
+		mergeAS4(agg, as4agg, as4path, &u.attrs)
 	}
 	return nil
+}
+
+const asTrans = 23456 // 2 바이트 AS 자리에 4 바이트 AS 를 대신하는 번호 (RFC 6793)
+
+// mergeAS4 : 2 바이트 AS peer (OLD speaker) 의 AS4_* 를 합침 (RFC 6793 4.2.3).
+// AGGREGATOR 의 AS 가 AS_TRANS 가 아니면 AS4_AGGREGATOR 와 AS4_PATH 를 모두 무시 (그 사이 OLD speaker 가 모았다는 뜻).
+// AS_TRANS 이면 aggregator = AS4_AGGREGATOR. AGGREGATOR 가 없으면 AS4_AGGREGATOR 는 무시하고 AS4_PATH 만.
+// 4 바이트 AS peer (NEW) 는 부르지 않음 = AS4_* 를 모두 무시 (RFC 6793 : NEW 끼리는 보내지 않음)
+func mergeAS4(agg, as4agg, as4path []byte, a *attrs) {
+	if len(agg) == 6 || len(agg) == 8 {
+		as := uint32(be16(agg))
+		if len(agg) == 8 {
+			as = be32(agg)
+		}
+		if as != asTrans {
+			return
+		}
+		if len(as4agg) == 8 {
+			a.aggregator = aggregatorString(as4agg)
+		}
+	}
+	if as4path != nil {
+		mergeAS4Path(as4path, a)
+	}
 }
 
 // parseAttr : 속성 하나
@@ -245,6 +279,7 @@ func parseAttr(typ uint8, v []byte, o pathOpts, u *update) error {
 //	개수      : RFC 4271 9.1.2.2 = AS_SET 은 묶음 하나를 1, CONFED 는 0 (RFC 5065) (openbmpd : 묶음 안 AS 를 하나씩 셈)
 //	origin    : 마지막 세그먼트가 AS_SEQUENCE 면 그 마지막 AS. AS_SET 이면 origin 을 하나로 정할 수 없음 (RFC 6811 : NONE)
 //	            -> originSet = 묶음 글자 "{38266,45271}" 을 origin_as 칸에 그대로 (openbmpd : 묶음의 마지막 AS 를 고름)
+//	            단 AS 가 하나뿐인 묶음 "{11139}" 은 origin 이 하나로 정해지므로 그 AS (숫자) (11-02 사용자)
 
 // asSeg : AS_PATH 세그먼트 하나 (typ 1 SET, 2 SEQUENCE, 3 CONFED_SEQUENCE, 4 CONFED_SET)
 type asSeg struct {
@@ -318,7 +353,11 @@ func (a *attrs) setPath(segs []asSeg) {
 		case 1:
 			set := setText(s.asns, "{", "}")
 			sb.WriteString(" " + set)
-			a.originAS, a.originSet = 0, set
+			if len(s.asns) == 1 { // AS 하나뿐인 묶음 : origin 은 그 AS
+				a.originAS, a.originSet = s.asns[0], ""
+			} else {
+				a.originAS, a.originSet = 0, set
+			}
 		case 3:
 			sb.WriteString(" (")
 			for i, n := range s.asns {

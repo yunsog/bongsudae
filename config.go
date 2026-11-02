@@ -44,12 +44,24 @@ var confKeys = map[string]string{
 	"bmp.allow":  "allow",
 	"bmp.raw":    "raw",
 	"bmp.chash":  "chash",
+	"bmp.rib":    "rib",
 
-	"kafka.brokers": "kafka",
-	"kafka.prefix":  "prefix",
+	"kafka.brokers":     "kafka",
+	"kafka.prefix":      "prefix",
+	"kafka.key_buckets": "key-buckets",
+	"kafka.format":      "format",
+	"kafka.partitions":  "partitions",
+	"kafka.replication": "replication",
+	"kafka.retention":   "retention",
 
 	"http.listen": "http",
 	"http.allow":  "http-allow",
+}
+
+// retiredSections : 없앤 구역. 남은 설정 파일이 시작을 막지 않게 키는 받고 무시 (기록 한 줄).
+// [export] = (프리픽스 -> origin AS) 파일 내보내기, 0.2.0-dev 에만 있었고 11-02 뺌 (사용자). 다음 판에서 이 표를 지움
+var retiredSections = map[string]string{
+	"export": "the (prefix -> origin AS) file export was removed in 0.2.0",
 }
 
 // confEntry : 설정 파일 한 항목 (줄 번호는 오류 표시용)
@@ -79,7 +91,7 @@ func parseConf(r io.Reader) ([]confEntry, error) {
 				continue
 			}
 			if strings.HasPrefix(line, "[") || strings.Contains(line, "=") {
-				return nil, fmt.Errorf("%d 줄 : %s 의 목록이 쉼표로 끝났는데 다음 값이 없음", cur.Line, cur.Key)
+				return nil, fmt.Errorf("line %d : list %s ends with a comma but no value follows", cur.Line, cur.Key)
 			}
 			cur.Val += line
 			if !strings.HasSuffix(line, ",") {
@@ -93,21 +105,25 @@ func parseConf(r io.Reader) ([]confEntry, error) {
 		}
 		if strings.HasPrefix(line, "[") {
 			if !strings.HasSuffix(line, "]") {
-				return nil, fmt.Errorf("%d 줄 : 구역 이름 %q", n, line)
+				return nil, fmt.Errorf("line %d : bad section name %q", n, line)
 			}
 			section = strings.TrimSpace(line[1 : len(line)-1])
 			continue
 		}
 		k, v, ok := strings.Cut(line, "=")
 		if !ok {
-			return nil, fmt.Errorf("%d 줄 : \"키 = 값\" 이 아님 : %q", n, line)
+			return nil, fmt.Errorf("line %d : not \"key = value\" : %q", n, line)
 		}
 		key := section + "." + strings.TrimSpace(k)
+		if why, old := retiredSections[section]; old {
+			log.Printf("config line %d : [%s] %s ignored (%s)", n, section, strings.TrimSpace(k), why)
+			continue
+		}
 		if _, ok := confKeys[key]; !ok {
-			return nil, fmt.Errorf("%d 줄 : 모르는 키 [%s] %s", n, section, strings.TrimSpace(k))
+			return nil, fmt.Errorf("line %d : unknown key [%s] %s", n, section, strings.TrimSpace(k))
 		}
 		if prev, dup := seen[key]; dup {
-			return nil, fmt.Errorf("%d 줄 : %s 가 %d 줄에도 있음", n, key, prev)
+			return nil, fmt.Errorf("line %d : %s already set on line %d", n, key, prev)
 		}
 		seen[key] = n
 		e := confEntry{Key: key, Val: strings.TrimSpace(v), Line: n}
@@ -121,7 +137,7 @@ func parseConf(r io.Reader) ([]confEntry, error) {
 		return nil, err
 	}
 	if cur != nil {
-		return nil, fmt.Errorf("%d 줄 : %s 의 목록이 쉼표로 끝났는데 파일이 끝남", cur.Line, cur.Key)
+		return nil, fmt.Errorf("line %d : list %s ends with a comma at end of file", cur.Line, cur.Key)
 	}
 	for i := range out {
 		out[i].Val = normList(out[i].Val)
@@ -190,11 +206,11 @@ func loadConfig(path string) ([]string, error) {
 	for _, e := range entries {
 		name := confKeys[e.Key]
 		if cmdGiven[name] {
-			applied = append(applied, e.Key+"=(명령줄 -"+name+")")
+			applied = append(applied, e.Key+"=(command line -"+name+")")
 			continue
 		}
 		if err := flag.Set(name, e.Val); err != nil {
-			return nil, fmt.Errorf("%s %d 줄 : %s = %q : %v", path, e.Line, e.Key, e.Val, err)
+			return nil, fmt.Errorf("%s line %d : %s = %q : %v", path, e.Line, e.Key, e.Val, err)
 		}
 		applied = append(applied, e.Key+"="+e.Val)
 	}
@@ -212,7 +228,7 @@ func reloadConf(who string) error {
 	confMu.Lock()
 	defer confMu.Unlock()
 	if confPath == "" {
-		log.Printf("설정 다시 읽기 (%s) : 설정 파일 없이 시작함 (규칙 파일만 다시 읽음)", who)
+		log.Printf("config reload (%s) : started without a config file (rules file reloaded only)", who)
 		return nil
 	}
 	entries, err := readConf(confPath)
@@ -268,21 +284,21 @@ func reloadConf(who string) error {
 		done = append(done, s)
 	}
 	if len(done) == 0 {
-		log.Printf("설정 다시 읽음 (%s, %s) : 바뀐 것 없음", confPath, who)
+		log.Printf("config reloaded (%s, %s) : no changes", confPath, who)
 	} else {
-		log.Printf("설정 다시 읽음 (%s, %s) : %s", confPath, who, strings.Join(done, ", "))
+		log.Printf("config reloaded (%s, %s) : %s", confPath, who, strings.Join(done, ", "))
 	}
 	if len(restart) > 0 {
 		var s []string
 		for _, ch := range restart {
-			s = append(s, fmt.Sprintf("%s (지금 %q, 파일 %q)", ch.key, ch.old, ch.new))
+			s = append(s, fmt.Sprintf("%s (running %q, file %q)", ch.key, ch.old, ch.new))
 		}
-		log.Printf("설정 다시 읽음 : 재시작해야 바뀌는 항목 (지금 값 유지) : %s", strings.Join(s, ", "))
+		log.Printf("config reloaded : restart needed for (running values kept) : %s", strings.Join(s, ", "))
 	}
 	return nil
 }
 
 func confFail(err error) error {
-	log.Printf("설정 다시 읽기 실패, 지금 값 유지 : %v", err)
+	log.Printf("config reload failed, running values kept : %v", err)
 	return err
 }

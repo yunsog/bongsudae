@@ -40,7 +40,7 @@ type originFilter struct {
 // newOriginFilter : origin_as / not_origin 중 하나 (둘 다면 오류, 둘 다 없으면 nil)
 func newOriginFilter(in, not []uint32) (*originFilter, error) {
 	if len(in) > 0 && len(not) > 0 {
-		return nil, fmt.Errorf("origin_as 와 not_origin 은 함께 쓸 수 없음")
+		return nil, fmt.Errorf("origin_as and not_origin cannot be used together")
 	}
 	f := &originFilter{list: in}
 	if len(not) > 0 {
@@ -65,7 +65,7 @@ func parseASList(name, s string) ([]uint32, error) {
 	for _, t := range strings.Split(s, ",") {
 		n, err := strconv.ParseUint(strings.TrimSpace(t), 10, 32)
 		if err != nil {
-			return nil, fmt.Errorf("%s=%q : AS 번호 (10 진수, 쉼표 구분)", name, s)
+			return nil, fmt.Errorf("%s=%q : AS numbers (decimal, comma separated)", name, s)
 		}
 		out = append(out, uint32(n))
 	}
@@ -304,7 +304,12 @@ func (c *collector) apiPrefix(w http.ResponseWriter, req *http.Request) {
 		httpErr(w, 404, "router %s not found", req.PathValue("ip"))
 		return
 	}
-	limit, _ := strconv.Atoi(qv.Get("limit"))
+	n, err := queryUint(qv, "limit", 1<<31-1) // 틀린 값은 400 (0.2.0 전에는 조용히 기본값)
+	if err != nil {
+		httpErr(w, 400, "%v", err)
+		return
+	}
+	limit := int(n)
 	q := findQuery{text: qv.Get("p"), p: p, how: how}
 	fr := c.findMany(list, []findQuery{q}, limit, f)[0]
 	if qv.Get("format") == "text" {
@@ -331,11 +336,11 @@ func (c *collector) apiPrefixBatch(w http.ResponseWriter, req *http.Request) {
 	d := json.NewDecoder(io.LimitReader(req.Body, 2<<20))
 	d.DisallowUnknownFields()
 	if err := d.Decode(&body); err != nil {
-		httpErr(w, 400, "본문 : %v (모양 {\"p\": [...], \"match\": \"more\", \"limit\": 100, \"not_origin\": [64500]})", err)
+		httpErr(w, 400, "body : %v (expected {\"p\": [...], \"match\": \"more\", \"limit\": 100, \"not_origin\": [64500]})", err)
 		return
 	}
 	if len(body.P) == 0 || len(body.P) > maxBatch {
-		httpErr(w, 400, "p : 1 ~ %d 개 (받은 것 %d 개)", maxBatch, len(body.P))
+		httpErr(w, 400, "p : 1 to %d entries (got %d)", maxBatch, len(body.P))
 		return
 	}
 	if body.Match != "" && !validMatch(body.Match) {
@@ -351,7 +356,7 @@ func (c *collector) apiPrefixBatch(w http.ResponseWriter, req *http.Request) {
 	for i, s := range body.P {
 		p, how, err := parseQuery(s)
 		if err != nil {
-			httpErr(w, 400, "p[%d] (%d 번째) %q : prefix (1.11.56.0/21) or address (1.11.56.10)", i, i+1, s)
+			httpErr(w, 400, "p[%d] (entry %d) %q : prefix (192.0.2.0/24) or address (192.0.2.1)", i, i+1, s)
 			return
 		}
 		if body.Match != "" {

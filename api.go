@@ -71,19 +71,21 @@ func parseHTTPAllow(s string) ([]netip.Prefix, error) {
 	return parseAllow(s)
 }
 
-func startAPI(addr string, c *collector) error {
+// ln 이 있으면 (판 올리기로 이어 받은 소켓) 그것을 씀
+func startAPI(addr string, c *collector, ln net.Listener) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/routers", c.apiRouters)
 	mux.HandleFunc("GET /api/routers/{ip}", c.apiRouter)
 	mux.HandleFunc("GET /api/peers", c.apiPeers)
 	mux.HandleFunc("GET /api/stats", c.apiStats) // 1 분 통계 60 분, 판, 메모리, Kafka (stats_api.go)
+	mux.HandleFunc("GET /metrics", c.apiMetrics) // Prometheus (metrics.go, 0.2.0)
 	mux.HandleFunc("GET /api/routers/{ip}/peers/{peer}", c.apiPeer)
-	mux.HandleFunc("GET /api/routers/{ip}/peers/{peer}/prefixes", c.apiPeerPrefixes)
-	mux.HandleFunc("GET /api/routers/{ip}/prefixes", c.apiRouterPrefixes)
-	mux.HandleFunc("GET /api/routers/{ip}/prefix", c.apiPrefix)
-	mux.HandleFunc("GET /api/prefix", c.apiPrefix)
-	mux.HandleFunc("POST /api/prefix", c.apiPrefixBatch)
-	mux.HandleFunc("POST /api/routers/{ip}/prefix", c.apiPrefixBatch)
+	mux.HandleFunc("GET /api/routers/{ip}/peers/{peer}/prefixes", c.needRIB(c.apiPeerPrefixes))
+	mux.HandleFunc("GET /api/routers/{ip}/prefixes", c.needRIB(c.apiRouterPrefixes))
+	mux.HandleFunc("GET /api/routers/{ip}/prefix", c.needRIB(c.apiPrefix))
+	mux.HandleFunc("GET /api/prefix", c.needRIB(c.apiPrefix))
+	mux.HandleFunc("POST /api/prefix", c.needRIB(c.apiPrefixBatch))
+	mux.HandleFunc("POST /api/routers/{ip}/prefix", c.needRIB(c.apiPrefixBatch))
 	mux.HandleFunc("GET /api/doc", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/markdown; charset=utf-8")
 		w.Write(apiDoc)
@@ -92,14 +94,19 @@ func startAPI(addr string, c *collector) error {
 		c.addRuleAPI(mux)
 		mux.HandleFunc("POST /api/routers/{ip}/reset", c.auth(c.apiReset)) // key 필요 (rules_api.go 의 auth)
 	}
-	ln, err := net.Listen("tcp", addr)
-	if err != nil {
-		return fmt.Errorf("-http %s: %w", addr, err)
+	if ln == nil {
+		var err error
+		if ln, err = net.Listen("tcp", addr); err != nil {
+			return fmt.Errorf("-http %s: %w", addr, err)
+		}
 	}
+	upg.mu.Lock()
+	upg.httpLn = ln // 판 올리기가 새 판에 넘김
+	upg.mu.Unlock()
 	sem := make(chan struct{}, apiConc)
 	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !httpAllowed(r.RemoteAddr) {
-			http.Error(w, "허용 대역 밖 (http.allow)", http.StatusForbidden)
+			http.Error(w, "not allowed (http.allow)", http.StatusForbidden)
 			return
 		}
 		sem <- struct{}{}
@@ -130,7 +137,8 @@ type routerJSON struct {
 	PeersDown  int               `json:"peers_down"`
 	RoutesV4   int               `json:"routes_v4"`
 	RoutesV6   int               `json:"routes_v6"`
-	Synced     int               `json:"peers_synced"` // up peer 중 처음 전체 전송을 다 받은 수 (End-of-RIB)
+	Synced     int               `json:"peers_synced"`  // up peer 중 처음 전체 전송을 다 받은 수 (End-of-RIB)
+	Settled    int               `json:"peers_settled"` // up peer 중 settled (synced 이거나 새 프리픽스가 5 분 없음, 0.2.0)
 	LastTerm   string            `json:"last_term,omitempty"`
 	LastReset  string            `json:"last_reset,omitempty"` // collector 가 끊은 (reset) 시각과 이유
 	ResetWhy   string            `json:"last_reset_why,omitempty"`
@@ -152,6 +160,7 @@ type peerJSON struct {
 	Since      string   `json:"since"`
 	PeerUp     bool     `json:"peer_up"` // 이번 세션의 Peer Up 을 받음 (경로 수가 정확)
 	Synced     bool     `json:"synced"`  // 처음 전체 전송을 다 받음 (협상된 종류마다 End-of-RIB)
+	Settled    bool     `json:"settled"` // synced 이거나, Peer Up 뒤 5 분 지났고 5 분 동안 새 프리픽스 없음 (0.2.0, EoR 을 안 넘기는 라우터용)
 	EoRV4      string   `json:"eor_v4,omitempty"`
 	EoRV6      string   `json:"eor_v6,omitempty"`
 	RoutesV4   int      `json:"routes_v4"`
@@ -179,6 +188,9 @@ type peerDetail struct {
 	SentCaps   string   `json:"sent_caps"`
 	RecvCaps   string   `json:"recv_caps"`
 	History    []string `json:"history"`
+	// BMP Stats Report (0.2.0) : 라우터가 보낸 마지막 값 (없으면 빠짐). 이름 = IANA 종류, 주소 종류마다는 _<afi>_<safi>
+	BMPStats   map[string]uint64 `json:"bmp_stats,omitempty"`
+	BMPStatsAt string            `json:"bmp_stats_at,omitempty"`
 }
 
 type routeJSON struct {
@@ -257,6 +269,9 @@ func (c *collector) routerView(r *router, now time.Time) routerJSON {
 		if p.synced() {
 			j.Synced++
 		}
+		if p.settled(now) {
+			j.Settled++
+		}
 		if p.up {
 			j.PeersUp++
 		} else {
@@ -289,7 +304,7 @@ func (c *collector) peerView(r *router, p *peer, detail bool) peerJSON {
 	j := peerJSON{Router: r.ip, RouterName: r.sysName, Peer: p.ip.String(), RD: p.rd, AS: p.as, BGPID: p.bgpID,
 		Type: peerTypeName(p.typ), State: stateName(p.up), Since: tstr(p.since), PeerUp: p.gotUp,
 		RoutesV4: len(p.rib4), RoutesV6: len(p.rib6), LastUpdate: tstr(p.lastUpdate), Adds: p.adds, Dels: p.dels,
-		DownReason: p.downReason, Synced: p.synced(), EoRV4: tstr(p.eorV4), EoRV6: tstr(p.eorV6)}
+		DownReason: p.downReason, Synced: p.synced(), Settled: p.settled(time.Now()), EoRV4: tstr(p.eorV4), EoRV6: tstr(p.eorV6)}
 	j.Kafka, j.KafkaFrom = c.rules.effective(r.ip, p.ip.Unmap().String())
 	if !p.up {
 		j.Warn = append(j.Warn, "down")
@@ -299,12 +314,18 @@ func (c *collector) peerView(r *router, p *peer, detail bool) peerJSON {
 	if p.noOpen {
 		j.Warn = append(j.Warn, "Peer Up without OPEN")
 	}
+	if c.noRIB {
+		j.Warn = append(j.Warn, "route table off (-rib=false)")
+	}
 	if detail {
 		d := &peerDetail{PrePolicy: p.flags&flagL == 0, AdjRibIn: p.flags&flagO == 0 && p.typ != peerTypeLocRIB,
 			AS4: p.flags&flagA == 0, LocalIP: p.localIP, LocalPort: p.localPort, RemotePort: p.rmtPort,
 			HoldSent: p.holdSent, HoldRecv: p.holdRecv, SentCaps: p.sentCaps, RecvCaps: p.recvCaps}
 		for _, e := range p.hist {
 			d.History = append(d.History, tstr(e.t)+" "+e.text)
+		}
+		if p.bmpStats != nil {
+			d.BMPStats, d.BMPStatsAt = p.bmpStats, tstr(p.bmpStatsAt)
 		}
 		j.Detail = d
 	}
@@ -398,9 +419,30 @@ func (c *collector) apiRouter(w http.ResponseWriter, req *http.Request) {
 	writeJSON(w, j)
 }
 
+// queryUint : 질의 값 하나를 0 ~ max 정수로 (없으면 0). 숫자가 아니거나 범위 밖이면 오류 (400 으로)
+func queryUint(q url.Values, name string, max uint64) (uint64, error) {
+	s := q.Get(name)
+	if s == "" {
+		return 0, nil
+	}
+	n, err := strconv.ParseUint(s, 10, 64)
+	if err != nil || n > max {
+		return 0, fmt.Errorf("%s=%q : not an integer 0 to %d", name, s, max)
+	}
+	return n, nil
+}
+
 func (c *collector) apiPeers(w http.ResponseWriter, req *http.Request) {
 	q := req.URL.Query()
-	asn, _ := strconv.ParseUint(q.Get("as"), 10, 32)
+	asn, err := queryUint(q, "as", 1<<32-1) // 틀린 값은 400 (0.2.0 전에는 조용히 무시 = 모두 보임)
+	if err != nil {
+		httpErr(w, 400, "%v", err)
+		return
+	}
+	if s := q.Get("state"); s != "" && s != "up" && s != "down" {
+		httpErr(w, 400, "state=%q : up | down", s)
+		return
+	}
 	out := []peerJSON{}
 	for _, r := range c.sortedRouters() {
 		if q.Get("router") != "" && q.Get("router") != r.ip {
@@ -600,7 +642,7 @@ func newListFilter(q url.Values) (*listFilter, error) {
 	}
 	if s := q.Get("p"); s != "" {
 		if f.p, f.how, err = parseQuery(s); err != nil {
-			return nil, fmt.Errorf("p=%q : 프리픽스 또는 주소", s)
+			return nil, fmt.Errorf("p=%q : not a prefix or address", s)
 		}
 		f.applied = append(f.applied, "p")
 		if m := q.Get("match"); m != "" {
@@ -611,7 +653,7 @@ func newListFilter(q url.Values) (*listFilter, error) {
 			f.applied = append(f.applied, "match")
 		}
 	} else if q.Get("match") != "" {
-		return nil, fmt.Errorf("match 는 p 와 함께")
+		return nil, fmt.Errorf("match needs p")
 	}
 	if f.origin, err = filterFromQuery(q); err != nil {
 		return nil, err
@@ -636,7 +678,7 @@ func newListFilter(q url.Values) (*listFilter, error) {
 	}{{"offset", &f.offset}, {"limit", &f.limit}} {
 		if s := q.Get(k.name); s != "" {
 			if *k.v, err = strconv.Atoi(s); err != nil || *k.v < 0 {
-				return nil, fmt.Errorf("%s=%q : 0 이상의 정수", k.name, s)
+				return nil, fmt.Errorf("%s=%q : not an integer >= 0", k.name, s)
 			}
 			f.applied = append(f.applied, k.name)
 		}
@@ -929,12 +971,12 @@ func (c *collector) apiReset(w http.ResponseWriter, req *http.Request) {
 	closeRouter := c.closeRouter
 	c.mu.RUnlock()
 	if closeRouter == nil {
-		httpErr(w, 409, "tcp 입력에서만 (지금은 %s 입력 : 끊을 라우터 연결이 없음)", *optInput)
+		httpErr(w, 409, "tcp input only (input is %s : no router connections to close)", *optInput)
 		return
 	}
 	ip, err := normIP(req.PathValue("ip"))
 	if err != nil {
-		httpErr(w, 400, "router %s : 주소가 아님", req.PathValue("ip"))
+		httpErr(w, 400, "router %s : not an address", req.PathValue("ip"))
 		return
 	}
 	why := "Closed by collector: api reset" + actor(req)
@@ -945,10 +987,21 @@ func (c *collector) apiReset(w http.ResponseWriter, req *http.Request) {
 		return
 	case errTooSoon:
 		w.Header().Set("Retry-After", strconv.Itoa(int(left.Seconds())+1))
-		httpErr(w, 429, "router %s : %s 에 한 번까지, %d 초 뒤에", ip, resetGap, int(left.Seconds())+1)
+		httpErr(w, 429, "router %s : at most once per %s, retry in %d s", ip, resetGap, int(left.Seconds())+1)
 		return
 	}
 	log.Printf("reset: router %s closed (from %s%s)", ip, req.RemoteAddr, actor(req))
 	writeJSON(w, resetJSON{Router: ip, Closed: true, At: tstr(time.Now()), Why: why,
-		Note: "라우터가 다시 접속하면 Initiation, Peer Up, 경로 전체를 다시 보냄 (재접속 간격은 라우터 설정). 진행은 peers_synced"})
+		Note: "the router reconnects (interval set on the router) and sends Initiation, Peer Up and its full tables again. Progress: peers_synced"})
+}
+
+// needRIB : 경로표가 필요한 API. -rib=false 면 409 (0.2.0)
+func (c *collector) needRIB(h http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, req *http.Request) {
+		if c.noRIB {
+			httpErr(w, 409, "route tables are off (-rib=false)")
+			return
+		}
+		h(w, req)
+	}
 }

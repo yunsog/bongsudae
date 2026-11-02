@@ -67,7 +67,7 @@ func (c *collector) routerMsg(r *router, action, name, descr, code, reason, init
 		clean(initData), clean(termData), tsString(0, 0, now), ""}
 	r.routerSeq++
 	r.stat.routerMsgs++
-	return makeMsg(c.cHash, kindRouter, r.hash, strings.Join(f, "\t")+"\n", 1)
+	return c.lineMsg(kindRouter, r.hash, f)
 }
 
 // initiation : TLV 1 = sysDescr, 2 = sysName, 0 = 글자
@@ -127,10 +127,11 @@ func termReason(code uint16) string {
 
 // peerRow : peer 메시지 31 필드 중 공통 부분을 채운 목록
 func (c *collector) peerRow(r *router, h *peerHdr, action string, now time.Time) []string {
-	ip := h.addr.String()
+	p := r.peerGet(h) // peer hash / 주소 글자 (없으면 만듦 : 바로 뒤 peerSession / markDown 도 만듦)
+	ip := p.ipStr
 	f := make([]string, 31)
 	f[0], f[1] = action, u32(r.peerSeq)
-	f[2], f[3] = md5hex(ip, rdString(h.rd), r.hash), r.hash
+	f[2], f[3] = p.key, r.hash
 	// f[4] name : 빈칸 (10-30 사용자 : rDNS 이름은 쓸모없고 찾는 데 시간만 듦 -> 찾지 않음)
 	f[5], f[6] = netip.AddrFrom4(h.bgpID).String(), r.ip
 	f[7], f[8], f[9], f[10] = tsString(h.sec, h.usec, now), u32(h.as), ip, rdString(h.rd)
@@ -154,7 +155,7 @@ func (c *collector) peerUpMsg(r *router, h *peerHdr, local netip.Addr, lport, rp
 		f[17], f[18] = strings.Join(sent.caps, ", "), strings.Join(recv.caps, ", ")
 		f[19], f[20] = u32(uint32(recv.hold)), u32(uint32(sent.hold))
 	}
-	return makeMsg(c.cHash, kindPeer, f[2], strings.Join(f, "\t")+"\n", 1)
+	return c.lineMsg(kindPeer, f[2], f)
 }
 
 // peerDownMsg : Peer Down -> 이유 1 바이트 + (1, 3 이면 NOTIFICATION 메시지, 2 이면 FSM event 2 바이트)
@@ -181,7 +182,7 @@ func (c *collector) peerDownMsg(r *router, h *peerHdr, b []byte, now time.Time) 
 			f[24] = fmt.Sprintf("Remote peer (%s) closed local (%s) session: No BGP notify message.", f[9], r.ip)
 		}
 	}
-	return makeMsg(c.cHash, kindPeer, f[2], strings.Join(f, "\t")+"\n", 1)
+	return c.lineMsg(kindPeer, f[2], f)
 }
 
 // notifyText : BGP NOTIFICATION 코드 글자 (표본 : 4/0, 6/6. 나머지는 RFC 4271 / 4486 이름)

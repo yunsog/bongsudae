@@ -31,6 +31,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -40,6 +41,16 @@ import (
 	"time"
 )
 
+// apiClient : 명령 (-status 등) 의 HTTP 요청. 서버가 받기만 하고 답하지 않아도 영원히 기다리지 않게 (0.2.0, 전에는 timeout 없음).
+// 연결 5 초, 응답 머리 2 분, 전체 10 분 (큰 경로 목록 내려받기)
+var apiClient = &http.Client{
+	Timeout: 10 * time.Minute,
+	Transport: &http.Transport{
+		DialContext:           (&net.Dialer{Timeout: 5 * time.Second}).DialContext,
+		ResponseHeaderTimeout: 2 * time.Minute,
+	},
+}
+
 // runClient : 옵션에 따라 GET / PUT / DELETE / POST 하나
 func runClient(api string, args []string) error {
 	api = strings.TrimSuffix(api, "/")
@@ -47,7 +58,7 @@ func runClient(api string, args []string) error {
 	q := url.Values{}
 	for _, a := range args {
 		if strings.HasPrefix(a, "-") {
-			return fmt.Errorf("옵션 %s 은 경로 앞에 (예 : -status -json routers)", a)
+			return fmt.Errorf("option %s must come before the path (e.g. -status -json routers)", a)
 		}
 		if k, v, ok := strings.Cut(a, "="); ok {
 			q.Add(k, v)
@@ -64,7 +75,7 @@ func runClient(api string, args []string) error {
 		topicsSet := false
 		flag.Visit(func(f *flag.Flag) { topicsSet = topicsSet || f.Name == "topics" })
 		if !topicsSet {
-			return errors.New("-set 은 -topics 필요 (보내지 않으려면 -topics none)")
+			return errors.New("-set needs -topics (-topics none to send nothing)")
 		}
 		topics := []string{}
 		if *optTopics != "none" {
@@ -165,7 +176,7 @@ func get(api string, segs []string, q url.Values) error {
 		} else if len(res.OriginAS) > 0 {
 			filter = fmt.Sprintf("  origin_as=%v", res.OriginAS)
 		}
-		fmt.Printf("%s  match=%s%s  %d / %d 줄\n\n", res.Query, res.Match, filter, res.Count, res.Total)
+		fmt.Printf("%s  match=%s%s  %d / %d rows\n\n", res.Query, res.Match, filter, res.Count, res.Total)
 		printRoutes(res.Routes)
 	case is(segs, "kafka", "rules"):
 		var j rulesJSON
@@ -193,7 +204,7 @@ func get(api string, segs []string, q url.Values) error {
 func callRule(method, u string, body []byte) error {
 	b, err := os.ReadFile(*optToken)
 	if err != nil {
-		return fmt.Errorf("key 파일 : %v (-token 으로 지정)", err)
+		return fmt.Errorf("key file : %v (set with -token)", err)
 	}
 	who := os.Getenv("USER")
 	if who == "" {
@@ -213,7 +224,7 @@ func callRule(method, u string, body []byte) error {
 		if err := json.NewDecoder(resp.Body).Decode(&j); err != nil {
 			return err
 		}
-		fmt.Printf("router %s : 끊음 (%s)\n  %s\n  %s\n", j.Router, short(j.At), j.Why, j.Note)
+		fmt.Printf("router %s : closed (%s)\n  %s\n  %s\n", j.Router, short(j.At), j.Why, j.Note)
 		return nil
 	}
 	if strings.HasSuffix(u, "/reload") {
@@ -221,7 +232,7 @@ func callRule(method, u string, body []byte) error {
 		if err := json.NewDecoder(resp.Body).Decode(&j); err != nil {
 			return err
 		}
-		fmt.Printf("다시 읽음 : %d 바뀜\n", len(j.Changes))
+		fmt.Printf("reloaded : %d changed\n", len(j.Changes))
 		for _, c := range j.Changes {
 			fmt.Println("  " + c)
 		}
@@ -247,9 +258,9 @@ func httpDo(method, u string, body []byte, hdr ...string) (*http.Response, error
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := apiClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("%v (bongsudae 가 -http 로 돌고 있는지 확인)", err)
+		return nil, fmt.Errorf("%v (is bongsudae running with -http ?)", err)
 	}
 	if resp.StatusCode != 200 {
 		b, _ := io.ReadAll(resp.Body)
@@ -278,11 +289,11 @@ func ago(s string) string {
 
 func printRouters(rs []routerJSON) {
 	tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "ROUTER\tNAME\tSTATE\tSINCE\tLAST MSG\tPEERS up/down\tSYNCED\tROUTES v4 / v6\tERR\tKAFKA\tWARN")
+	fmt.Fprintln(tw, "ROUTER\tNAME\tSTATE\tSINCE\tLAST MSG\tPEERS up/down\tSYNCED / SETTLED\tROUTES v4 / v6\tERR\tKAFKA\tWARN")
 	up, peersUp, peersDown := 0, 0, 0
 	for _, r := range rs {
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%ds\t%d / %d\t%d\t%d / %d\t%d\t%s\t%s\n", r.IP, r.Name, r.State, short(r.Since),
-			r.LastMsgAgo, r.PeersUp, r.PeersDown, r.Synced, r.RoutesV4, r.RoutesV6, r.Errors, kafkaText(r.Kafka, r.KafkaFrom),
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%ds\t%d / %d\t%d / %d\t%d / %d\t%d\t%s\t%s\n", r.IP, r.Name, r.State, short(r.Since),
+			r.LastMsgAgo, r.PeersUp, r.PeersDown, r.Synced, r.Settled, r.RoutesV4, r.RoutesV6, r.Errors, kafkaText(r.Kafka, r.KafkaFrom),
 			strings.Join(r.Warn, ", "))
 		if r.State == "up" {
 			up++
@@ -292,8 +303,19 @@ func printRouters(rs []routerJSON) {
 	}
 	tw.Flush()
 	if len(rs) > 1 {
-		fmt.Printf("\n합계 : 라우터 %d / %d up, peer %d up · %d down\n", up, len(rs), peersUp, peersDown)
+		fmt.Printf("\ntotal : routers %d / %d up, peers %d up · %d down\n", up, len(rs), peersUp, peersDown)
 	}
+}
+
+// syncText : SYNCED 칸 = yes (End-of-RIB) / settled (EoR 없이 5 분 새 프리픽스 없음) / no
+func syncText(p peerJSON) string {
+	switch {
+	case p.Synced:
+		return "yes"
+	case p.Settled:
+		return "settled"
+	}
+	return "no"
 }
 
 func printPeers(ps []peerJSON) {
@@ -301,7 +323,7 @@ func printPeers(ps []peerJSON) {
 	fmt.Fprintln(tw, "ROUTER\tPEER\tAS\tBGP ID\tTYPE\tSTATE\tSINCE\tSYNCED\tROUTES v4 / v6\tLAST UPDATE\tADD / DEL\tKAFKA\tWARN")
 	for _, p := range ps {
 		fmt.Fprintf(tw, "%s\t%s\t%d\t%s\t%s\t%s\t%s\t%s\t%d / %d\t%s\t%d / %d\t%s\t%s\n", p.Router, p.Peer, p.AS, p.BGPID, p.Type,
-			p.State, short(p.Since), yesNo(p.Synced), p.RoutesV4, p.RoutesV6, ago(p.LastUpdate), p.Adds, p.Dels, kafkaText(p.Kafka, p.KafkaFrom),
+			p.State, short(p.Since), syncText(p), p.RoutesV4, p.RoutesV6, ago(p.LastUpdate), p.Adds, p.Dels, kafkaText(p.Kafka, p.KafkaFrom),
 			strings.Join(p.Warn, ", "))
 	}
 	tw.Flush()
@@ -318,9 +340,9 @@ func printPeer(p *peerJSON) {
 	fmt.Println()
 	fmt.Printf("  session   local %s:%d  remote port %d  hold sent %d / recv %d\n", d.LocalIP, d.LocalPort, d.RemotePort, d.HoldSent, d.HoldRecv)
 	fmt.Printf("  sent cap  %s\n  recv cap  %s\n", d.SentCaps, d.RecvCaps)
-	fmt.Printf("  routes    v4 %d / v6 %d  (synced %v, End-of-RIB v4 %s v6 %s)\n", p.RoutesV4, p.RoutesV6, p.Synced,
+	fmt.Printf("  routes    v4 %d / v6 %d  (synced %v, settled %v, End-of-RIB v4 %s v6 %s)\n", p.RoutesV4, p.RoutesV6, p.Synced, p.Settled,
 		short(p.EoRV4), short(p.EoRV6))
-	fmt.Printf("  updates   last %s ago, add %d / del %d (이번 up 이후)\n", ago(p.LastUpdate), p.Adds, p.Dels)
+	fmt.Printf("  updates   last %s ago, add %d / del %d (since this up)\n", ago(p.LastUpdate), p.Adds, p.Dels)
 	fmt.Printf("  kafka     %s (from %s)\n", topicsText(p.Kafka), p.KafkaFrom)
 	if len(p.Warn) > 0 {
 		fmt.Printf("  warn      %s\n", strings.Join(p.Warn, ", "))
@@ -351,7 +373,7 @@ func kafkaText(t []string, from string) string {
 
 // printRules : 규칙 전체 표 + 토픽별 지난 1 분
 func printRules(j *rulesJSON) {
-	fmt.Printf("file %s (읽음 / 씀 %s), 토픽 = %s.<이름>\n\n", j.File, short(j.Loaded), j.Prefix)
+	fmt.Printf("file %s (read / written %s), topics = %s.<name>\n\n", j.File, short(j.Loaded), j.Prefix)
 	tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 	fmt.Fprintln(tw, "SCOPE\tROUTER\tPEER\tTOPICS")
 	fmt.Fprintf(tw, "default\t\t\t%s\n", topicsText(j.Rules.Default))
@@ -360,7 +382,7 @@ func printRules(j *rulesJSON) {
 		if rr.Topics != nil {
 			fmt.Fprintf(tw, "router\t%s\t\t%s\n", ip, topicsText(*rr.Topics))
 		} else {
-			fmt.Fprintf(tw, "router\t%s\t\t(default 를 따름)\n", ip)
+			fmt.Fprintf(tw, "router\t%s\t\t(follows default)\n", ip)
 		}
 		for _, p := range sortedKeys(rr.Peers) {
 			fmt.Fprintf(tw, "peer\t%s\t%s\t%s\n", ip, p, topicsText(rr.Peers[p]))
@@ -373,7 +395,7 @@ func printRules(j *rulesJSON) {
 	for _, t := range j.Topics {
 		note := ""
 		if !t.InRules {
-			note = "(규칙에 없음)"
+			note = "(not in rules)"
 		}
 		fmt.Fprintf(tw, "%s.%s\t%d\t%d\t%s\n", j.Prefix, t.Topic, t.Msgs1m, t.Rows1m, note)
 	}
@@ -389,7 +411,7 @@ func printRule(j *ruleJSON) {
 	if j.Peer != "" {
 		target += " peer " + j.Peer
 	}
-	rule := "(없음 : 위 단계를 따름)"
+	rule := "(none : follows the level above)"
 	if j.Rule != nil {
 		rule = topicsText(*j.Rule)
 	}
@@ -407,11 +429,4 @@ func sortedKeys[V any](m map[string]V) []string {
 	}
 	slices.SortFunc(keys, cmpAddr)
 	return keys
-}
-
-func yesNo(b bool) string {
-	if b {
-		return "yes"
-	}
-	return "-"
 }

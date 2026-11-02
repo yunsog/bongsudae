@@ -1,6 +1,6 @@
 # Bongsudae Kafka messages
 
-This document describes the messages Bongsudae (release 0.1) writes to Kafka.
+This document describes the messages Bongsudae (release 0.2) writes to Kafka.
 The format is the OpenBMP Message Bus API **v1.7**, the same as the output of openbmpd 2.2.3,
 so consumers written for openbmpd can read Bongsudae output without changes.
 Where openbmpd does not follow the RFCs, Bongsudae follows the RFCs; those cases are listed in section 7.
@@ -20,6 +20,14 @@ See also: the web API reference (`api.md`) and the user manual (`manual.md`).
 
 - **Same key = same partition = order is kept.** The unicast_prefix and peer messages of one peer are read in the order they were sent.
   Order across topics is not guaranteed (for example, a peer down and that peer's unicast_prefix lines).
+- **Splitting the unicast_prefix key (0.2.0+, config `kafka.key_buckets` / option `-key-buckets`, default 0 = one key per peer)** :
+  with N > 0 every row goes to bucket FNV-1a("prefix/length") % N, rows of one bucket form one message, and the key is `<peer hash>.<bucket>`.
+  One prefix of one router + peer always gets the same key, so its order is kept, while a big full-table peer is spread over several partitions.
+  One UPDATE then becomes several messages (one per bucket, adds before deletes as before); the rows themselves (all 32 fields, seq included) do not change.
+  Order across different prefixes of one peer is no longer guaranteed. Changing it needs a restart; coordinate with consumers, since one prefix can briefly sit in two partitions.
+  - **Bongsudae chooses the partition itself** instead of leaving it to Kafka's murmur2(key): for a key `<peer hash>.<bucket>` the partition is (murmur2(peer hash) + bucket) % number of partitions,
+    so the buckets of one peer sit on neighbouring partitions, one each. Other keys (peer, router, bmp_raw messages) use Kafka's default murmur2(key), i.e. the same partition as without buckets.
+    Measured on a full routing table (78.9 M rows, 8 partitions), the largest / smallest partition share was 1.73 with one key per peer, 1.21 with bucket keys hashed by Kafka, and 1.00 with this method.
 - The topic prefix is set with `-prefix` (config key `kafka.prefix`); the default is `openbmp.parsed`.
   For a test instance use e.g. `-prefix openbmp.test` (topics `openbmp.test.unicast_prefix`, ...).
 - The bmp_raw topic name is the prefix with a trailing `.parsed` removed, plus `.bmp_raw`
@@ -89,6 +97,25 @@ R: 1
   router messages use the time the message was received.
 - With `-input kafka` (re-processing a bmp_raw topic), C_HASH_ID and the router hash are taken from the bmp_raw record header.
 
+### 2.1 JSON format (option `-format json`, config `kafka.format = json`, default `openbmp`)
+
+For new consumers that do not read the openbmp format. Topic names, Kafka keys and message splitting (one UPDATE = one add message + one del message, `kafka.key_buckets`)
+are the same as above; **only the message value differs**: no header (V / C_HASH_ID / T / L / R), one JSON object per line (NDJSON, each line ends with `\n`). The topic tells the type.
+
+```
+{"action":"add","seq":2830337,"hash":"01f2...","router_hash":"e306...","router_ip":"192.0.2.162","base_attr_hash":"4f35...","peer_hash":"ec4a...","peer_ip":"198.51.100.20","peer_asn":64500,"timestamp":"2026-11-01 09:42:10.123456","prefix":"203.0.113.0","prefix_len":24,"is_ipv4":true,"origin":"igp","as_path":"64500 64510","as_path_count":2,"origin_as":64510,"nexthop":"198.51.100.20","med":0,"local_pref":100,"aggregator":"","community_list":"64500:1","ext_community_list":"","cluster_list":"","is_atomic_agg":false,"is_nexthop_ipv4":true,"originator_id":"","path_id":0,"labels":"","is_pre_policy":true,"is_adj_rib_in":true,"large_community_list":""}
+{"action":"del","seq":2830338,"hash":"54f4...","router_hash":"e306...","router_ip":"192.0.2.162","peer_hash":"ec4a...","peer_ip":"198.51.100.20","peer_asn":64500,"timestamp":"2026-11-01 09:42:10.123456","prefix":"198.51.100.0","prefix_len":24,"is_ipv4":true,"path_id":0,"labels":"","is_pre_policy":true,"is_adj_rib_in":true}
+```
+
+- Field names are the names in the tables of sections 3, 4 and 5, in the same order (peer flags in snake_case: `is_l3vpn`, `is_pre_policy`, `is_ipv4`, `is_loc_rib`, `is_loc_rib_filtered`).
+- Values are the openbmp text with a type: numeric fields are JSON numbers, 0 / 1 flags are `true` / `false`, `origin_as` is a number
+  (or the text `"{a,b}"` when the path ends with an AS_SET of two or more ASes), `as_path` / `cluster_list` have no leading or trailing space. Other fields (communities etc.) are the same text as in the openbmp format.
+- unicast_prefix `del` lines have no attribute fields (base_attr_hash, origin ... originator_id, large_community_list).
+- router / peer: empty numeric or flag fields are omitted (e.g. `local_asn` of a Peer Up without OPENs, `bmp_reason` of an up). Empty text fields are `""`.
+- Quotes, backslashes and control characters are escaped as JSON requires; invalid UTF-8 becomes `\ufffd`. A newline in a router description is the two characters `\n` as in the openbmp format.
+- bmp_raw is unchanged (BMP bytes). Changing the format needs a restart; with `-upgrade` the new format starts at that moment, so coordinate with consumers.
+- Message splitting is the same, so the ordering guarantee per router + peer + prefix is the same.
+
 ---
 
 ## 3. unicast_prefix (32 fields)
@@ -114,7 +141,7 @@ the add message comes first. Within a message, IPv4 lines come before IPv6 lines
 | 13 | origin | `igp` | `igp` / `egp` / `incomplete` |
 | 14 | as_path | ` 64496 64497 64498 64511` | **leading space**, one space before each AS. AS_SET: ` {64510,64511}` (braces, comma inside). AS_CONFED_SEQUENCE: ` (65001 65002)`. AS_CONFED_SET: ` [65001,65002]` |
 | 15 | as_path_count | `4` | path length per RFC 4271 9.1.2.2: an AS_SET counts as 1; confederation segments count as 0 (RFC 5065) |
-| 16 | origin_as | `64511` or `{64510,64511}` | last AS of the last AS_SEQUENCE. **If the path ends with an AS_SET, the AS_SET text** (RFC 6811: the origin cannot be determined), so this field is not always a number |
+| 16 | origin_as | `64511` or `{64510,64511}` | last AS of the last AS_SEQUENCE. **If the path ends with an AS_SET of two or more ASes, the AS_SET text** (RFC 6811: the origin cannot be determined), so this field is not always a number. A set of one AS (`{64512}`) gives that AS (`64512`, 0.2.0+) |
 | 17 | nexthop | `2001:db8::20:234` | next hop. IPv4 routes use NEXT_HOP if present, otherwise the MP_REACH next hop. For IPv6, the global address (a link-local second address is not shown) |
 | 18 | med | `1000` | MULTI_EXIT_DISC (`0` if absent) |
 | 19 | local_pref | `70` | LOCAL_PREF (`0` if absent) |
@@ -247,7 +274,10 @@ If an Initiation / Termination message carries several TLVs of the same type, th
 | 0 ~ 4 | RFC 7854 4.5 names: `Session administratively closed`, `Unspecified reason`, `Out of resources`, `Redundant connection`, `Session permanently administratively closed` | the router sent a Termination message |
 | 65534 | `Closed by collector: api reset` (+ ` actor=<X-Actor header>` if given) | the connection was closed by the web API reset |
 | 65534 | `Closed by collector: not in bmp.allow (config reload)` | after a configuration reload, the router is no longer in the allowed address list |
+| 65534 | `Closed by collector: shutdown` | (0.2.0+) Bongsudae is stopping (stop / restart); one per connected router. 0.1 sent no term on shutdown |
 | 65535 | `Connection closed` | the TCP connection closed without a Termination message |
+
+- (0.2.0+) When a router opens a new connection (Initiation) while an old one is still open, the old one is closed without a term: consumers see two `init` messages, the new session takes over.
 
 ---
 
@@ -300,7 +330,7 @@ Bongsudae follows the RFCs. Consumers that compare text with openbmpd output wil
 |---|---|---|
 | as_path | ` { 64510 64511 }` | ` {64510,64511}` (one token when split on spaces) |
 | as_path_count | each AS inside the set is counted | one AS_SET counts as 1 (RFC 4271 9.1.2.2); confederation segments count as 0 (RFC 5065) |
-| origin_as when the path ends with an AS_SET | the last AS in the set (`64512`) | the set text (`{64512}`, `{64510,64511}`), because the origin cannot be determined (RFC 6811) |
+| origin_as when the path ends with an AS_SET | the last AS in the set (`{64510,64511}` -> `64511`) | the set text (`{64510,64511}`), because the origin cannot be determined (RFC 6811). A set of one AS (`{64512}`) gives `64512` (0.2.0+; 0.1 gave `{64512}`) |
 
 ### 7.3 Other differences
 
@@ -311,6 +341,8 @@ Bongsudae follows the RFCs. Consumers that compare text with openbmpd output wil
 | Peer Up without OPEN messages (RFC 7854 violation by the router) | fails to parse it, closes the whole router connection and emits router `term` 65534; no routes from that router are processed | keeps the connection, emits a peer `up` with empty capability / AS / hold time fields (section 4), logs one line and counts it in the statistics (`peer_up_no_open`) |
 | router_hash | computed by a method that could not be reproduced from its inputs | md5(router IP + C_HASH_ID). Because peer_hash, hash, base_attr_hash and the Kafka keys are derived from it, these values differ from openbmpd's for the same router |
 | bmp_raw | messages that fail to parse are not sent | every received message is sent |
+| (0.2.0+) NLRI trailing bits after the prefix length (RFC 4271 4.3) | not checked | cleared, e.g. `10.1.1` with length 23 becomes `10.1.0.0/23` |
+| (0.2.0+) AGGREGATOR / AS4_AGGREGATOR from a 2-octet AS peer (RFC 6793 4.2.3) | | AGGREGATOR AS 23456 : aggregator = AS4_AGGREGATOR; any other AS : AS4_AGGREGATOR and AS4_PATH are ignored |
 
 With these rules applied to openbmpd output, Bongsudae's output was compared line by line with openbmpd's on the same input;
 no other differences were found in unicast_prefix lines. peer messages are identical except for seq.

@@ -29,6 +29,10 @@ WorkingDirectory=/var/lib/bongsudae
 ExecStartPre=/bin/mkdir -p /var/lib/bongsudae/conf /var/lib/bongsudae/run
 ExecStart=/usr/local/bin/bongsudae
 ExecReload=/bin/kill -HUP $MAINPID
+# watchdog : bongsudae sends WATCHDOG=1 after each 1-minute statistics pass (it takes every router lock).
+# No signal for 180 s (e.g. a deadlock) -> systemd restarts it.
+WatchdogSec=180
+NotifyAccess=main
 Restart=always
 RestartSec=10
 # SIGTERM : messages still in the buffer are sent to Kafka before exit
