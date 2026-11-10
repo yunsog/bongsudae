@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"net/http"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -174,6 +175,15 @@ func (c *collector) apiMetrics(w http.ResponseWriter, req *http.Request) {
 	m.val("bongsudae_kafka_messages_total", float64(raw), "kind", "bmp_raw")
 	m.head("bongsudae_other_afi_total", "counter", "MP_REACH / MP_UNREACH of address families other than IPv4 / IPv6 unicast (counted, not forwarded).")
 	m.val("bongsudae_other_afi_total", float64(cum.others))
+	m.head("bongsudae_other_family_total", "counter", "The same, per address family (e.g. bgp-ls, rt-constraint).")
+	fs := make([]family, 0, len(cum.otherFam))
+	for f := range cum.otherFam {
+		fs = append(fs, f)
+	}
+	slices.Sort(fs)
+	for _, f := range fs {
+		m.val("bongsudae_other_family_total", float64(cum.otherFam[f]), "family", f.String())
+	}
 	if p != nil {
 		m.head("bongsudae_kafka_fails_total", "counter", "Kafka produce failures since start.")
 		m.val("bongsudae_kafka_fails_total", float64(p.fails.Load()))

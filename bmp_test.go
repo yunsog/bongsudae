@@ -143,32 +143,32 @@ func TestRIBCount(t *testing.T) {
 	add := &update{attrs: attrs{asPath: " 65000 1", nextHop: "10.0.0.1"}, v4Add: []prefix{pfx("1.0.0.0/24")},
 		v6Add: []prefix{pfx("2001:db8::/32")}}
 	for i := 0; i < 100; i++ {
-		p.apply(add, testNow)
+		p.apply(viewInPre, add, testNow, allOn)
 	}
-	if len(p.rib4) != 1 || len(p.rib6) != 1 {
-		t.Fatalf("100 add : v4 %d v6 %d (1, 1 이어야)", len(p.rib4), len(p.rib6))
+	if inPre(p).rib4.size() != 1 || inPre(p).rib6.size() != 1 {
+		t.Fatalf("100 add : v4 %d v6 %d (1, 1 이어야)", inPre(p).rib4.size(), inPre(p).rib6.size())
 	}
-	p.apply(&update{v4Del: []prefix{pfx("9.9.9.0/24")}}, testNow) // 없는 것
-	p.apply(&update{v4Del: []prefix{pfx("1.0.0.0/24")}}, testNow)
-	if len(p.rib4) != 0 || len(p.rib6) != 1 {
-		t.Fatalf("del : v4 %d v6 %d", len(p.rib4), len(p.rib6))
+	p.apply(viewInPre, &update{v4Del: []prefix{pfx("9.9.9.0/24")}}, testNow, allOn) // 없는 것
+	p.apply(viewInPre, &update{v4Del: []prefix{pfx("1.0.0.0/24")}}, testNow, allOn)
+	if inPre(p).rib4.size() != 0 || inPre(p).rib6.size() != 1 {
+		t.Fatalf("del : v4 %d v6 %d", inPre(p).rib4.size(), inPre(p).rib6.size())
 	}
 	// 찾기 : 주소 하나로 longest, /16 으로 more
-	p.apply(&update{v4Add: []prefix{pfx("1.0.0.0/16"), pfx("1.0.1.0/24")}}, testNow)
+	p.apply(viewInPre, &update{v4Add: []prefix{pfx("1.0.0.0/16"), pfx("1.0.1.0/24")}}, testNow, allOn)
 	q, how, _ := parseQuery("1.0.1.9")
-	if m := match(r, p, q, how); len(m) != 1 || m[0].pfx.String() != "1.0.1.0/24" {
+	if m := match(r, p, -1, q, how); len(m) != 1 || m[0].pfx.String() != "1.0.1.0/24" {
 		t.Fatalf("longest %v", m)
 	}
 	q, _, _ = parseQuery("1.0.0.0/16")
-	if m := newCollector("x").findMany([]routerPeer{{r, p}}, []findQuery{{p: q, how: "more"}}, 0, nil)[0]; m.total != 2 {
-		t.Fatalf("more %v", m.rows)
+	if ms, _ := newCollector("x").findMany([]routerPeer{{r, p}}, []findQuery{{p: q, how: "more"}}, 0, nil, -1, 0); ms[0].total != 2 {
+		t.Fatalf("more %v", ms[0].rows)
 	}
-	if m := match(r, p, netip.MustParsePrefix("1.0.1.0/24"), "covering"); len(m) != 2 {
+	if m := match(r, p, -1, netip.MustParsePrefix("1.0.1.0/24"), "covering"); len(m) != 2 {
 		t.Fatalf("covering %v", m)
 	}
 	r.routerDown(testNow, "connection closed")
-	if p.up || len(p.rib4)+len(p.rib6) != 0 {
-		t.Fatalf("router down : up %v routes %d", p.up, len(p.rib4)+len(p.rib6))
+	if p.up || inPre(p).rib4.size()+inPre(p).rib6.size() != 0 {
+		t.Fatalf("router down : up %v routes %d", p.up, inPre(p).rib4.size()+inPre(p).rib6.size())
 	}
 }
 
@@ -346,7 +346,7 @@ func TestSettled(t *testing.T) {
 		x := netip.MustParsePrefix(s)
 		return []prefix{{addr: x.Addr(), length: x.Bits()}}
 	}
-	p.apply(&update{v4Add: pfx("192.0.2.0/24")}, t0.Add(time.Minute))
+	p.apply(viewInPre, &update{v4Add: pfx("192.0.2.0/24")}, t0.Add(time.Minute), allOn)
 	if p.settled(t0.Add(4 * time.Minute)) {
 		t.Fatal("Peer Up 뒤 5 분 전")
 	}
@@ -356,16 +356,16 @@ func TestSettled(t *testing.T) {
 	if !p.settled(t0.Add(6 * time.Minute)) {
 		t.Fatal("새 프리픽스 뒤 5 분")
 	}
-	p.apply(&update{v4Add: pfx("192.0.2.0/24")}, t0.Add(7*time.Minute)) // 이미 있는 것 : 그대로
-	p.apply(&update{v4Del: pfx("192.0.2.0/24")}, t0.Add(7*time.Minute))
+	p.apply(viewInPre, &update{v4Add: pfx("192.0.2.0/24")}, t0.Add(7*time.Minute), allOn) // 이미 있는 것 : 그대로
+	p.apply(viewInPre, &update{v4Del: pfx("192.0.2.0/24")}, t0.Add(7*time.Minute), allOn)
 	if !p.settled(t0.Add(8 * time.Minute)) {
 		t.Fatal("바꾸기 / 지우기는 늘어난 것이 아님")
 	}
-	p.apply(&update{v4Add: pfx("198.51.100.0/24")}, t0.Add(9*time.Minute))
+	p.apply(viewInPre, &update{v4Add: pfx("198.51.100.0/24")}, t0.Add(9*time.Minute), allOn)
 	if p.settled(t0.Add(10 * time.Minute)) {
 		t.Fatal("새 프리픽스 뒤 1 분")
 	}
-	p.eorV4 = t0.Add(10 * time.Minute) // End-of-RIB 면 바로
+	inPre(p).eorV4 = t0.Add(10 * time.Minute) // End-of-RIB 면 바로
 	if !p.settled(t0.Add(10 * time.Minute)) {
 		t.Fatal("synced")
 	}

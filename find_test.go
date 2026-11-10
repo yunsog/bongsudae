@@ -30,7 +30,6 @@ func TestFind(t *testing.T) {
 			h := peerHdr{addr: netip.AddrFrom4([4]byte{10, 0, byte(ri), byte(pi)}), as: 65000 + uint32(pi)}
 			p := r.peerGet(&h)
 			p.up = true
-			p.rib4, p.rib6 = map[key4]route{}, map[key6]route{}
 			for i := 0; i < 3000; i++ {
 				n := 8 + rnd.Intn(17)
 				a := netip.AddrFrom4([4]byte{byte(1 + rnd.Intn(3)), byte(rnd.Intn(256)), byte(rnd.Intn(256)), 0})
@@ -45,12 +44,12 @@ func TestFind(t *testing.T) {
 					o := uint32(64500 + rnd.Intn(3))
 					at = attr(fmt.Sprintf("3356 %d", o), o)
 				}
-				p.rib4[k4(pf.Addr(), n)] = route{a: at, t: uint32(i)}
+				inPre(p).rib4.set(k4(pf.Addr(), n), route{a: at, t: uint32(i)})
 			}
 			v6, _ := netip.MustParseAddr("2001:db8::").Prefix(32)
-			p.rib6[k6(v6.Addr(), 32)] = route{a: attr("64500", 64500)}
-			for k, v := range p.rib4 {
-				all = append(all, ribRow{router: r.ip, peer: p.ip.String(), peerAS: p.as, pfx: k.prefix(), rt: v})
+			inPre(p).rib6.set(k6(v6.Addr(), 32), route{a: attr("64500", 64500)})
+			for k, v := range inPre(p).rib4.all() {
+				all = append(all, ribRow{router: r.ip, peer: p.ip.String(), peerAS: p.as, pfx: k.prefix(), rt: v.rt})
 			}
 		}
 	}
@@ -62,7 +61,10 @@ func TestFind(t *testing.T) {
 	}
 	f, _ := newOriginFilter(nil, []uint32{64500})
 	start := time.Now()
-	res := c.findMany(list, qs, 7, f)
+	res, err := c.findMany(list, qs, 7, f, -1, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
 	t.Logf("findMany %v", time.Since(start))
 	for i, q := range qs {
 		want := 0
@@ -85,7 +87,8 @@ func TestFind(t *testing.T) {
 		t.Logf("%s : total %d", q.text, res[i].total)
 	}
 	// limit 없이 찾은 앞 7 줄 = limit 7 의 결과 (줄여 가며 세도 같음)
-	full := c.findMany(list, qs[:1], 0, f)[0]
+	fulls, _ := c.findMany(list, qs[:1], 0, f, -1, 0)
+	full := fulls[0]
 	for i := 0; i < 7; i++ {
 		if full.rows[i].pfx != res[0].rows[i].pfx || full.rows[i].peer != res[0].rows[i].peer {
 			t.Fatalf("row %d differs", i)
@@ -115,16 +118,15 @@ func TestListFilter(t *testing.T) {
 	for pi := 0; pi < 2; pi++ {
 		h := peerHdr{addr: netip.AddrFrom4([4]byte{10, 0, 0, byte(pi)}), as: 65000}
 		p := r.peerGet(&h)
-		p.rib4, p.rib6 = map[key4]route{}, map[key6]route{}
 		for i := 0; i < 20; i++ {
 			a := a1
 			if i%5 == 0 {
 				a = a2
 			}
-			p.rib4[k4(netip.AddrFrom4([4]byte{1, 2, byte(i), 0}), 24)] = route{a: a}
+			inPre(p).rib4.set(k4(netip.AddrFrom4([4]byte{1, 2, byte(i), 0}), 24), route{a: a})
 		}
-		p.rib4[k4(netip.AddrFrom4([4]byte{1, 2, 0, 0}), 16)] = route{a: a1}
-		p.rib6[k6(netip.MustParseAddr("2001:db8::"), 32)] = route{a: a1}
+		inPre(p).rib4.set(k4(netip.AddrFrom4([4]byte{1, 2, 0, 0}), 16), route{a: a1})
+		inPre(p).rib6.set(k6(netip.MustParseAddr("2001:db8::"), 32), route{a: a1})
 	}
 	get := func(peer, q string) (int, []string, string, string) {
 		path := "/api/routers/192.0.2.1/prefixes"

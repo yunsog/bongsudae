@@ -43,20 +43,37 @@ func clean(s string) string {
 	return strings.ReplaceAll(s, "\t", " ")
 }
 
-// tlvs : BMP 정보 TLV (종류 2 + 길이 2 + 값) -> 종류별 글자 (같은 종류는 공백으로 이음)
+// tlvMax : 정보 TLV 한 종류에 이어 붙이는 글자 상한 (sysDescr 도 수백 바이트). 넘게 하는 값은 버림 (11-05)
+const tlvMax = 4096
+
+// tlvs : BMP 정보 TLV (종류 2 + 길이 2 + 값) -> 종류별 글자 (같은 종류는 공백으로 이음, 종류마다 tlvMax 까지).
+// (11-05) 전에는 같은 종류가 나올 때마다 글자 전체를 새로 만들어 (m[t] + " " + v), 1 MB 메시지에 1 바이트 TLV
+// 20 만 개면 CPU 21 초 (제곱). 이제 종류마다 Builder 에 이어 붙임 (한 번 훑음)
 func tlvs(b []byte) map[uint16]string {
-	m := map[uint16]string{}
+	sb := map[uint16]*strings.Builder{}
 	for len(b) >= 4 {
 		t, n := be16(b), int(be16(b[2:]))
 		if 4+n > len(b) {
 			break
 		}
-		v := string(b[4 : 4+n])
-		if m[t] != "" {
-			v = m[t] + " " + v
-		}
-		m[t] = v
+		v := b[4 : 4+n]
 		b = b[4+n:]
+		w := sb[t]
+		if w == nil {
+			w = &strings.Builder{}
+			sb[t] = w
+		}
+		if w.Len() > 0 && w.Len()+1+len(v) > tlvMax { // 첫 값은 길어도 그대로 (TLV 하나는 64 KB 까지), 이어 붙이는 것만 상한
+			continue
+		}
+		if w.Len() > 0 { // 전과 같음 : 앞 글자가 비어 있으면 공백 없이
+			w.WriteByte(' ')
+		}
+		w.Write(v)
+	}
+	m := make(map[uint16]string, len(sb))
+	for t, w := range sb {
+		m[t] = w.String()
 	}
 	return m
 }

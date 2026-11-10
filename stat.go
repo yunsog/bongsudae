@@ -3,13 +3,16 @@ package main
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 )
 
 type stats struct {
 	bmpType    [bmpTypeCount + 1]int // BMP 종류별 건수 (마지막 = 모르는 종류)
 	errors     int                   // 해석 오류 메시지 수
-	others     int                   // unicast 가 아닌 MP_REACH / UNREACH (VPN 등, 버림)
+	others     int                   // 해석기가 없는 종류의 MP_REACH / UNREACH (VPN 등, 버림)
+	otherFam   map[family]int        // 그 종류마다 (0.3.0, 없으면 nil)
+	famRows    int                   // unicast 밖 종류의 줄 (labeled_unicast_prefix, l3vpn, multicast_prefix : 0.3.0)
 	add        int                   // add 줄
 	del        int                   // del 줄
 	msgs       int                   // 보낸 Kafka 메시지
@@ -40,6 +43,12 @@ func (s *stats) String() string {
 	if s.noOpen > 0 {
 		p = append(p, fmt.Sprintf("peer_up_no_open=%d", s.noOpen))
 	}
+	if s.famRows > 0 {
+		p = append(p, fmt.Sprintf("family_rows=%d", s.famRows))
+	}
+	if len(s.otherFam) > 0 { // 버린 종류 (0.3.0) : "other_families: bgp-ls=12,rt-constraint=3"
+		p = append(p, "other_families: "+familyCounts(s.otherFam))
+	}
 	return strings.Join(p, " ")
 }
 
@@ -57,6 +66,32 @@ func (s *stats) addAll(o *stats) {
 	s.peerMsgs += o.peerMsgs
 	s.noOpen += o.noOpen
 	s.dropped += o.dropped
+	s.famRows += o.famRows
+	for f, n := range o.otherFam {
+		s.addOther(f, n)
+	}
+}
+
+// addOther : 버린 종류 f 를 n 번
+func (s *stats) addOther(f family, n int) {
+	if s.otherFam == nil {
+		s.otherFam = map[family]int{}
+	}
+	s.otherFam[f] += n
+}
+
+// familyCounts : "bgp-ls=12,rt-constraint=3" (종류 번호 순)
+func familyCounts(m map[family]int) string {
+	fs := make([]family, 0, len(m))
+	for f := range m {
+		fs = append(fs, f)
+	}
+	slices.Sort(fs)
+	var p []string
+	for _, f := range fs {
+		p = append(p, fmt.Sprintf("%s=%d", f, m[f]))
+	}
+	return strings.Join(p, ",")
 }
 
 // bmpTotal : 받은 BMP 메시지 수 (종류 모두)

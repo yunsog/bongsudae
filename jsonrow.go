@@ -131,6 +131,14 @@ func (e *rowEnc) initJSON(v4 bool) {
 			b = jsonKV(b, "large_community_list", e.a.largeComm)
 		}
 		e.segC = append(b, '}', '\n')
+		// 경로 종류 (0.3.0) : labels 는 줄마다, 그 뒤는 같음
+		e.tailPre = jsonKB(e.tailPre[:0], "is_pre_policy", rp.prePolicy)
+		e.tailPre = jsonKB(e.tailPre, "is_adj_rib_in", rp.adjRibIn)
+		e.tailLast = e.tailLast[:0]
+		if !e.del {
+			e.tailLast = jsonKV(e.tailLast, "large_community_list", e.a.largeComm)
+		}
+		e.tailLast = append(e.tailLast, '}', '\n')
 	}
 }
 
@@ -152,7 +160,16 @@ func (e *rowEnc) rowJSON(b []byte, seq uint64, h *[32]byte, p prefix, i int) []b
 	b = strconv.AppendInt(b, int64(p.length), 10)
 	b = append(b, e.segB[i]...)
 	b = strconv.AppendUint(b, uint64(p.pathID), 10)
-	return append(b, e.segC...)
+	if !e.ext {
+		return append(b, e.segC...)
+	}
+	b = jsonKV(b, "labels", string(e.labels))
+	b = append(b, e.tailPre...)
+	if e.vpn {
+		b = jsonKV(b, "rd", rdString(e.rd))
+		b = jsonKN(b, "rd_type", uint64(be16(e.rd[:2])))
+	}
+	return append(b, e.tailLast...)
 }
 
 // 필드 이름과 형 : s = 글자, n = 숫자, b = 0 / 1 깃발 (빈 n / b 는 뺌)

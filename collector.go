@@ -67,8 +67,11 @@ type collector struct {
 	cHash string       // C_HASH_ID (collector 해시, openbmpd 설정 값 그대로)
 	// keyBuckets : unicast_prefix 메시지를 프리픽스 칸으로 나눔 (Kafka key 1-B, -key-buckets). 0 = 나누지 않음 (key = peer hash)
 	keyBuckets int
-	// noRIB : 경로표를 들지 않음 (-rib=false, 0.2.0). 줄 / Kafka 는 같고, 경로 수 / 프리픽스 찾기 API 만 못 씀 (메모리 대비)
+	// rib : 경로표를 드는 경로 종류 (-rib / bmp.rib, 0.3.0 : 종류 목록). 줄 / Kafka 는 같고, 꺼진 종류는 경로 수 / 찾기 API 만 못 씀 (메모리 대비)
+	// noRIB = 하나도 없음 (0.2.0 의 -rib=false), on = unicast 둘의 켜짐
+	rib   map[family]bool
 	noRIB bool
+	on    ribOn
 	// json : Kafka 메시지를 JSON 으로 (-format json, 0.2.0, jsonrow.go). false = openbmp v1.7 (기본)
 	json    bool
 	seq     atomic.Uint64 // 줄 번호 (줄마다 1 씩, 여러 goroutine 이 함께 씀)
@@ -85,7 +88,10 @@ type collector struct {
 }
 
 func newCollector(cHash string) *collector {
-	return &collector{cHash: cHash, routers: map[string]*router{}}
+	c := &collector{cHash: cHash, routers: map[string]*router{}}
+	fams, _ := parseRIBFamilies(defaultRIB) // 기본 = IPv4 / IPv6 unicast 경로표 (옵션 -rib 이 바꿈 : setRIB)
+	c.setRIB(fams)
+	return c
 }
 
 // lockRouter : 라우터를 찾거나 만들고 쓰기 잠금을 잡아 돌려줌 (부른 쪽이 r.mu.Unlock)
@@ -194,19 +200,27 @@ func (c *collector) routeMon(r *router, b []byte, now time.Time) ([]outMsg, erro
 		p.up, p.gotUp, p.since, p.downReason = true, false, now, ""
 		p.addEvent(now, "seen in route monitoring (no Peer Up)")
 	}
-	o := pathOpts{as4: h.flags&flagA == 0, addPathV4: p.addPathV4, addPathV6: p.addPathV6}
+	o := pathOpts{as4: h.flags&flagA == 0, addPathV4: p.addPathV4, addPathV6: p.addPathV6, addPaths: p.addPathFams}
 	u, err := parseUpdate(body, o)
 	if err != nil {
 		return nil, err
 	}
 	r.stat.others += u.others
-	if c.noRIB {
-		p.countOnly(u, now)
-	} else {
-		p.apply(u, now)
+	for _, f := range u.otherFams {
+		r.stat.addOther(f, 1)
 	}
-	p.gotEoR(u, now)
-	return c.updateMsgs(r, &rp, u), nil
+	v := viewOf(h.typ, h.flags) // 보기 (In / Out, pre / post, Loc-RIB) 마다 경로표 따로 (rib.go)
+	if c.noRIB {
+		p.countOnly(v, u, now)
+	} else {
+		p.apply(v, u, now, c.on)
+	}
+	p.gotEoR(v, u, now)
+	out := c.updateMsgs(r, &rp, u)
+	if u.fams != nil { // unicast 밖 종류 (famroute.go) : 고정 토픽
+		out = c.famMsgs(r, &rp, u, out)
+	}
+	return out, nil
 }
 
 // updateMsgs : add 메시지 하나 + del 메시지 하나 (openbmpd 처럼 섞지 않음)
@@ -315,7 +329,14 @@ func (c *collector) peerSession(r *router, h *peerHdr, local netip.Addr, lport, 
 	p.localIP, p.localPort, p.rmtPort = local.String(), lport, rport
 	p.holdSent, p.holdRecv, p.sentCaps, p.recvCaps = 0, 0, "", ""
 	p.addPathV4, p.addPathV6, p.famV4, p.famV6 = false, false, false, false
+	p.fams, p.addPathFams = nil, nil
 	if sent != nil && recv != nil {
+		p.fams = famsOn(*sent, *recv)
+		for _, f := range p.fams {
+			if addPathOn(*sent, *recv, f.afi(), f.safi()) {
+				p.addPathFams = append(p.addPathFams, f)
+			}
+		}
 		p.famV4 = famOn(*sent, *recv, afiIPv4, safiUnicast)
 		p.famV6 = famOn(*sent, *recv, afiIPv6, safiUnicast)
 		p.holdSent, p.holdRecv = sent.hold, recv.hold
@@ -467,7 +488,51 @@ func (c *collector) logStat(p *producer) {
 	}
 	log.Printf("stat routers=%d %s%s kafka_fail=%d%s", len(rs), total.String(), raw, fails, topics)
 	m.Routers, m.Counts = len(rs), total.counts()
+	if len(total.otherFam) > 0 {
+		m.OtherFamilies = map[string]int{}
+		for f, n := range total.otherFam {
+			m.OtherFamilies[f.String()] = n
+		}
+	}
 	hist.add(m, &total, p) // GET /api/stats (stats_api.go), /metrics (metrics.go)
+}
+
+// setRIB : 경로표를 들 종류를 정함 (시작 때). 해석기가 아직 없는 종류는 기록 한 줄
+func (c *collector) setRIB(fams map[family]bool) {
+	c.rib = fams
+	c.noRIB = len(fams) == 0
+	c.on = ribOn{v4: fams[famOf(afiIPv4, safiUnicast)], v6: fams[famOf(afiIPv6, safiUnicast)]}
+	for f := range fams {
+		if ribSupported[f] && f.safi() != safiUnicast { // unicast 밖 종류 표 (famrib.go, flowspec.go)
+			if c.on.fam == nil {
+				c.on.fam = map[family]bool{}
+			}
+			c.on.fam[f] = true
+		}
+	}
+	var later []family
+	for f := range fams {
+		if !ribSupported[f] {
+			later = append(later, f)
+		}
+	}
+	if len(later) > 0 {
+		log.Printf("route tables : %s not kept by this release yet (Kafka output only, or counted and dropped)", strings.Join(familyList(later), ", "))
+	}
+}
+
+// ribOff : peer 가 협상한 종류 (fams, 없으면 unicast 둘) 중 경로표를 들 수 있는데 꺼진 것 (API 경고)
+func (c *collector) ribOff(fams []family) []string {
+	if len(fams) == 0 {
+		fams = []family{famOf(afiIPv4, safiUnicast), famOf(afiIPv6, safiUnicast)}
+	}
+	var off []family
+	for _, f := range fams {
+		if ribSupported[f] && !c.rib[f] {
+			off = append(off, f)
+		}
+	}
+	return familyList(off)
 }
 
 // statErr : 라우터를 모르는 오류 하나 (Kafka bmp_raw 머리가 깨짐 등)

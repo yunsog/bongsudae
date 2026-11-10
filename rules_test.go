@@ -139,16 +139,16 @@ func TestEoR(t *testing.T) {
 	}
 	p := &peer{up: true, gotUp: true, famV4: true, famV6: true}
 	now := time.Now()
-	p.gotEoR(&update{eorV4: true}, now)
+	p.gotEoR(viewInPre, &update{eorV4: true}, now)
 	if p.synced() {
 		t.Fatal("synced before v6 EoR")
 	}
-	p.gotEoR(&update{eorV6: true}, now)
+	p.gotEoR(viewInPre, &update{eorV6: true}, now)
 	if !p.synced() {
 		t.Fatal("not synced")
 	}
 	p.markDown(now, "test")
-	if p.synced() || !p.eorV4.IsZero() {
+	if p.synced() || !p.view(-1).eorV4.IsZero() {
 		t.Fatal("down keeps sync")
 	}
 }

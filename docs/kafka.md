@@ -17,6 +17,11 @@ See also: the web API reference (`api.md`) and the user manual (`manual.md`).
 | `openbmp.parsed.peer` | peer up / down | peer hash |
 | `openbmp.parsed.router` | router init / term (BMP session start / end) | router hash |
 | `openbmp.bmp_raw` | BMP messages exactly as received from the router (not parsed) | router hash |
+| `openbmp.parsed.labeled_unicast_prefix` | (0.3.0+) IPv4 / IPv6 labeled unicast (SAFI 4, including 6PE) route lines: the same 32 fields as unicast_prefix, field 28 labels | peer hash |
+| `openbmp.parsed.l3vpn` | (0.3.0+) VPNv4 / VPNv6 (SAFI 128) route lines: 34 fields (section 3.2) | peer hash |
+| `openbmp.parsed.multicast_prefix` | (0.3.0+) IPv4 / IPv6 multicast (SAFI 2) route lines: the same 32 fields as unicast_prefix | peer hash |
+| `openbmp.parsed.evpn` | (0.3.0+) EVPN (AFI 25 / SAFI 70) route lines: OpenBMP evpn, 40 fields (section 3.3) | peer hash |
+| `openbmp.parsed.flowspec` | (0.3.0+) FlowSpec rules (IPv4 / IPv6 / VPN, SAFI 133 / 134). **Bongsudae's own format**, 43 fields (section 3.4, not in OpenBMP) | peer hash |
 
 - **Same key = same partition = order is kept.** The unicast_prefix and peer messages of one peer are read in the order they were sent.
   Order across topics is not guaranteed (for example, a peer down and that peer's unicast_prefix lines).
@@ -35,8 +40,11 @@ See also: the web API reference (`api.md`) and the user manual (`manual.md`).
 - **Forwarding rules** (section 1.1) can send unicast_prefix messages of a given router / peer to other topics, or not at all.
   peer, router and bmp_raw messages are always sent, regardless of the rules.
 - No compression (so consumers can read without a compression library).
-- openbmpd's `collector`, `bmp_stat`, `base_attribute`, `l3vpn`, `evpn` and `ls_*` topics are not produced.
-  Routes that are not IPv4 / IPv6 unicast (VPN, EVPN, BGP-LS, ...) are counted and dropped.
+- openbmpd's `collector`, `bmp_stat`, `base_attribute` and `ls_*` topics are not produced.
+  Address families that are not parsed (BGP-LS, MVPN, RT constraint, ...) are counted per family and dropped (`other_families:` in the stat line).
+- (0.3.0+) **Address family topics** (`labeled_unicast_prefix`, `l3vpn`, `multicast_prefix`, `evpn`, `flowspec`) are created when the first such route arrives (log `kafka topic ... : first ... route`).
+  Forwarding rules apply to unicast_prefix only; family rows always go to their topic. Row seq numbers share the unicast_prefix sequence.
+  `labeled_unicast_prefix` has its own topic (openbmpd mixed it into unicast_prefix, where a withdrawal carries no labels and cannot be told apart from a unicast withdrawal); `multicast_prefix` has no OpenBMP counterpart.
 
 ### 1.1 Forwarding rules (unicast_prefix only)
 
@@ -159,6 +167,9 @@ the add message comes first. Within a message, IPv4 lines come before IPv6 lines
 | 31 | large_community_list | `64500:1:2` | `global:local1:local2`, space separated |
 
 - **del lines**: fields 5 and 13 ~ 26 and 31 are empty (a withdrawal carries no attributes). path_id, isPrePolicy and isAdjRibIn are filled.
+- **Loc-RIB lines (RFC 9069) are the lines whose peer_ip (field 7) is `0.0.0.0`** (IPv6 routes too). The Loc-RIB per-peer header carries
+  peer address 0, and peer_asn is the router's own AS. isPrePolicy / isAdjRibIn are `1` / `0`, the same as Adj-RIB-Out pre-policy lines,
+  so those two fields cannot tell them apart: use peer_ip `0.0.0.0`. The peer message has field 28 isLocRIB = 1.
 - **No del lines are sent when a peer goes down.** On a peer `down` (or a router `term`, section 5) the consumer must remove all
   routes of that peer itself (same as openbmpd).
 - AS4_PATH is merged into AS_PATH when the session uses 2-byte AS numbers (RFC 6793).
@@ -193,6 +204,98 @@ the same way as the transitive ones.
 | anything else (unknown) | `0xTTSS:` + the 6 value bytes in hex (TT = type, SS = sub-type) | `0x0043:006400000001` |
 
 ---
+
+### 3.2 Address family topics (0.3.0+): labeled_unicast_prefix, l3vpn, multicast_prefix
+
+Following the OpenBMP schema (https://www.openbmp.org/api/kafka_message_schema.html, v1.7).
+
+- **labeled_unicast_prefix / multicast_prefix**: the same 32 fields as unicast_prefix (section 3), except
+  - 28 `labels` (labeled_unicast_prefix): label values (20-bit MPLS labels), top of stack first, comma separated, e.g. `16001,3`. Empty for multicast.
+    The compatibility label 0x800000 of a withdrawal (RFC 8277 2.4) is not printed.
+  - 17 `nexthop`: the MP_REACH next hop of that family (6PE next hops stay in their IPv4-mapped form, e.g. `::ffff:192.0.2.9`).
+- **l3vpn** (34 fields): fields 0 to 30 as unicast_prefix (including 28 labels), then
+
+| # | Name | Example | Meaning |
+|---|---|---|---|
+| 31 | route_distinguisher | `64496:1` | RD text (RFC 4364 4.2: type 0 = 2-octet AS:number, 1 = IPv4:number, 2 = 4-octet AS:number), the same form as peer_rd in peer messages |
+| 32 | rd_type | `0` | RD type (0 / 1 / 2) |
+| 33 | large_community_list | | as field 31 of unicast_prefix |
+
+  - 17 `nexthop`: the VPN next hop without its RD (always 0, 8 bytes).
+- Row hash (field 2) of family rows follows the OpenBMP schema: md5(prefix + length byte + [RD 8 bytes (l3vpn)] + peer hash + [path ID 4 bytes if not 0] + [`1` if labels]).
+  unicast_prefix row hashes are unchanged (prefix + length + peer hash, as openbmpd).
+- JSON format (section 2.1): `labels` is text (`"16001,3"`); l3vpn rows carry `"rd": "64496:1"` and `"rd_type": 0` before `large_community_list`.
+
+### 3.3 evpn (0.3.0+, OpenBMP schema, 40 fields)
+
+| # | Name | Meaning |
+|---|---|---|
+| 0 - 9 | action ... timestamp | as fields 0 - 9 of unicast_prefix (no prefix fields) |
+| 10 - 23 | origin ... originator_id | the attributes of unicast_prefix fields 13 - 26 (empty for del) |
+| 24 | path_id | Add-Path |
+| 25 / 26 | isPrePolicy / isAdjIn | |
+| 27 / 28 | rd / rd_type | `64496:100`, `0` |
+| 29 / 30 | originating_router_ip_len / ip | route types 3 and 4 only (`32`, `192.0.2.9`) |
+| 31 | ethernet_tag_id | 8 hex digits (`00000064`); empty for type 4 |
+| 32 | esi | ESI type 0 = 9 value bytes in hex; 1 / 2 = MAC, space, key / priority; 3 = MAC, local discriminator; 4 = router ID, discriminator; 5 = AS, discriminator. Empty for type 3 |
+| 33 / 34 | mac_len / mac | route type 2 only (`48`, `00:11:22:33:44:55`) |
+| 35 / 36 | ip_len / ip | the IP of type 2; **for type 5 (RFC 9136) the IP prefix length / address** |
+| 37 / 38 | mpls_label1 / mpls_label2 | MPLS label value (20 bits); **the 24-bit VNI when the route carries a VXLAN / NVGRE / VXLAN-GPE encapsulation (ext community encap=8 / 9 / 12, RFC 8365)** |
+| 39 | large_community_list | |
+
+- The OpenBMP schema has no route type field (1 Ethernet A-D, 2 MAC/IP, 3 Inclusive Multicast, 4 Ethernet Segment, 5 IP Prefix); in TSV it shows from the filled fields. Unknown types (6+) are skipped.
+- Row hash: md5(peer hash + MAC + MAC length + IP + IP length + ESI + RD + route type + [path ID] + [1 if labels]) as in the schema.
+- JSON: the same names in snake_case plus `route_type` and, for type 5, `gateway_ip`; empty fields are omitted.
+- No route tables for EVPN yet (Kafka rows only).
+
+### 3.4 flowspec (0.3.0+, Bongsudae's own format: not in the OpenBMP schema)
+
+FlowSpec (RFC 8955 IPv4, RFC 8956 IPv6) carries **traffic rules** (which packets, what action), not routes.
+The OpenBMP schema has no FlowSpec topic, so Bongsudae defines one, laid out like the other topics: common fields, then the rule, the actions and the path attributes.
+
+- One topic `<prefix>.flowspec` carries IPv4 (1/133), IPv6 (2/133), VPNv4 (1/134) and VPNv6 (2/134) rules (told apart by isIPv4 and rd)
+- key = peer hash; the topic is created when the first rule arrives; forwarding rules (for unicast_prefix) do not apply
+- add = rule received (the same rule again means its actions / attributes changed), del = rule withdrawn
+
+| # | Name | Example | Meaning |
+|---|---|---|---|
+| 0 - 9 | action ... timestamp | | as fields 0 - 9 of unicast_prefix (hash 2: below) |
+| 10 | isIPv4 | `1` | 1 for IPv4 rules, 0 for IPv6 |
+| 11 | rd | `64496:1` | RD of VPN FlowSpec (SAFI 134), otherwise empty |
+| 12 | **rule** | `dst 203.0.113.0/24 proto =6 dport =80,=443` | the whole rule (components in type order, name + value): fields 13 - 25 on one line |
+| 13 | dst_prefix | `203.0.113.0/24` | component 1, destination prefix (IPv6 with a non-zero offset: `2001:db8::/32@8`) |
+| 14 | src_prefix | `198.51.100.0/24` | component 2, source prefix |
+| 15 | protocol | `=6` | component 3, IP protocol (IPv6: next header) |
+| 16 | port | `=53` | component 4, source or destination port |
+| 17 | dst_port | `=80,=443` | component 5 |
+| 18 | src_port | `>=1024&<=65535` | component 6 |
+| 19 | icmp_type | `=8` | component 7 |
+| 20 | icmp_code | `=0` | component 8 |
+| 21 | tcp_flags | `syn&!ack` | component 9 (bits: below) |
+| 22 | packet_length | `>=1000` | component 10 |
+| 23 | dscp | `=46` | component 11 |
+| 24 | fragment | `isf` | component 12 (bits: below) |
+| 25 | flow_label | `=5` | component 13 (IPv6 only) |
+| 26 | traffic_rate | `0` | action: rate limit in bytes/s (value of ext community `flow-rate=`). **0 = drop**. Empty when absent |
+| 27 | traffic_action | `T` | action: `S` (sample) / `T` (terminal = later rules are not evaluated) / `ST` (`flow-act=`) |
+| 28 | redirect | `64496:100` | action: redirect to the VRF of this route target (`flow-redir=`) |
+| 29 | traffic_marking | `46` | action: rewrite DSCP to this value (`flow-remark=`) |
+| 30 - 39 | origin, as_path, as_path_count, origin_as, nexthop, med, local_pref, community_list, ext_community_list, large_community_list | | as in unicast_prefix |
+| 40 | path_id | `0` | Add-Path |
+| 41 / 42 | isPrePolicy / isAdjRibIn | `1` / `1` | |
+
+- del rows: 5 base_attr_hash and 26 - 39 (actions, attributes) are empty. The rule fields (10 - 25) are filled (what was withdrawn)
+- Value text (a short form of the RFC 8955 4.2.1 operators)
+  - Numeric components (protocol, ports, ICMP, length, DSCP, flow label): operator + value per term. Operators `=` `>` `<` `>=` `<=` `!=`, always true `true`, always false `false`.
+    AND between terms is `&`, OR is `,` (AND binds first: `>=1024&<=2048,=80` = 1024 - 2048 or 80)
+  - Bitmask components (tcp_flags, fragment): per term `!` (not) + `=` (all bits must match; without it, any bit) + bit names joined by `|`.
+    tcp_flags = `fin` `syn` `rst` `psh` `ack` `urg` `ece` `cwr` (other bits as `0x0100`), fragment = `df` (don't fragment) `isf` (is fragment) `ff` (first) `lf` (last).
+    Terms are joined with `&` / `,` as for numbers (`syn&!ack` = SYN and not ACK)
+  - Component names in the rule field: `dst` `src` `proto` `port` `dport` `sport` `icmp-type` `icmp-code` `tcp-flags` `len` `dscp` `frag` `flow-label` (space separated)
+- Row hash (field 2): md5(isIPv4 1 byte + RD 8 bytes + rule NLRI bytes + peer hash + [path ID]) = the same rule gets the same hash
+- A rule with an unknown component type (outside RFC 8955 / 8956) is dropped alone (each rule has its own length, so the next one is still read) and counted in the stat line `other_families:` under its family (e.g. `ipv4-flowspec`)
+- JSON: the same names in snake_case; empty fields are omitted; traffic_rate / traffic_marking / path_id are numbers, the rest are strings (rule and components as above)
+- Route table: only when `bmp.rib` lists `ipv4-flowspec` etc. Key = (RD, rule bytes). API list `family=ipv4-flowspec` (rule order); prefix lookup matches rules whose dst_prefix overlaps the prefix
 
 ## 4. peer (31 fields)
 

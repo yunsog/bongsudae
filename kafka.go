@@ -39,6 +39,8 @@ type producer struct {
 
 	regoneMu sync.Mutex
 	regoneAt map[string]time.Time // 토픽을 다시 읽은 시각 (topicGone, 30 초에 한 번)
+
+	famMade sync.Map // 만든 경로 종류 토픽 (0.3.0 : labeled_unicast_prefix, l3vpn, multicast_prefix 는 처음 쓸 때 만듦)
 }
 
 const (
@@ -198,6 +200,9 @@ func ensureTopic(cl *kgo.Client, topic string) error {
 func (p *producer) send(msgs []outMsg) {
 	for _, m := range msgs {
 		if m.kind != kindPrefix {
+			if familyKinds[m.kind] {
+				p.ensureFamily(m.kind)
+			}
 			p.produce(m.kind, &m)
 			continue
 		}
@@ -207,6 +212,21 @@ func (p *producer) send(msgs []outMsg) {
 				p.rules.count(t, m.rows)
 			}
 		}
+	}
+}
+
+// ensureFamily : 경로 종류 토픽을 처음 쓸 때 만듦 (그 라우터 goroutine 이 한 번 기다림. 실패하면 기록하고 보내기는 해 봄 = 자동 생성에 맡김)
+func (p *producer) ensureFamily(kind string) {
+	if _, ok := p.famMade.Load(kind); ok {
+		return
+	}
+	t := p.prefix + "." + kind
+	if err := ensureTopic(p.cl, t); err != nil {
+		kafkaErrs.add(err.Error())
+		return
+	}
+	if _, loaded := p.famMade.LoadOrStore(kind, true); !loaded {
+		log.Printf("kafka topic %s : first %s route, topic ready", t, kind)
 	}
 }
 

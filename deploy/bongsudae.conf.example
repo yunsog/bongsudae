@@ -25,13 +25,13 @@ lock  = /var/lib/bongsudae/run/bongsudae.lock      # lock file : a second copy e
 
 [bmp]
 listen = :5000                       # address for BMP sessions from routers (restart)              option -listen
-allow  = 127.0.0.1, ::1              # routers allowed to connect : addresses / prefixes (reload)   option -allow
-                                     #   e.g. 192.0.2.0/24, 2001:db8::/64 (router loopbacks)
+allow  = 0.0.0.0/0, ::/0             # routers allowed to connect : addresses / prefixes (reload)   option -allow
+                                     #   default = any address. Narrow if you can, e.g. 192.0.2.0/24, 2001:db8::/64 (router loopbacks)
                                      #   on reload, current sessions from routers no longer allowed are closed
 raw    = true                        # forward every received BMP message to openbmp.bmp_raw (reload)  option -raw
 chash  =                             # C_HASH_ID in message headers, 32 hex digits (restart)        option -chash
                                      #   empty = md5(host name). Also used in router hashes : keep it stable
-rib    = true                        # keep per-peer route tables in memory (restart)              option -rib
+rib    = ipv4-unicast, ipv6-unicast  # address families with route tables (restart) : list, all, none (forward only)  option -rib
                                      #   false = forward only : much less memory, no route counts / prefix lookup API
 
 

@@ -4,6 +4,7 @@ package main
 import (
 	"fmt"
 	"net/netip"
+	"slices"
 	"strconv"
 )
 
@@ -131,6 +132,22 @@ func famOn(sent, recv openMsg, afi uint16, safi uint8) bool {
 		return o.mp[k]
 	}
 	return on(sent) && on(recv)
+}
+
+// famsOn : 두 OPEN 이 함께 알린 경로 종류 모두 (0.3.0, MP 능력이 둘 다 없으면 IPv4 unicast 만), 번호 순
+func famsOn(sent, recv openMsg) []family {
+	if len(sent.mp) == 0 && len(recv.mp) == 0 {
+		return []family{famOf(afiIPv4, safiUnicast)}
+	}
+	var out []family
+	for k := range sent.mp {
+		f := family(k)
+		if famOn(sent, recv, f.afi(), f.safi()) {
+			out = append(out, f)
+		}
+	}
+	slices.Sort(out)
+	return out
 }
 
 // addPathOn : 라우터가 peer 에게서 받은 경로에 path id 가 붙는지.

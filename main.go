@@ -45,7 +45,7 @@ var (
 	optConf      = flag.String("c", "", "config file (-input tcp and API commands only). Empty = "+defConfig+" if it exists. Command line options win")
 	optInput     = flag.String("input", "tcp", "input : tcp | kafka | file")
 	optListen    = flag.String("listen", ":5000", "tcp : listen address for BMP")
-	optAllow     = flag.String("allow", "127.0.0.1,::1", "tcp : allowed routers, addresses / prefixes (comma separated), e.g. the loopback range")
+	optAllow     = flag.String("allow", "0.0.0.0/0,::/0", "tcp : allowed routers, addresses / prefixes (comma separated). Default = any address (routers are remote; use a firewall or the loopback range to narrow)")
 	optKafka     = flag.String("kafka", "127.0.0.1:9092", "Kafka bootstrap servers")
 	optPrefix    = flag.String("prefix", "openbmp.parsed", "output topic prefix (<prefix>.unicast_prefix / .router / .peer). Tests : openbmp.test")
 	optSrc       = flag.String("src", "openbmp.bmp_raw", "kafka : topic to read (bmp_raw)")
@@ -56,7 +56,7 @@ var (
 	optRepl      = flag.Int("replication", 1, "replication factor of topics the collector creates")
 	optRetention = flag.Duration("retention", 90*time.Minute, "retention (retention.ms) of topics the collector creates")
 	optFormat    = flag.String("format", "openbmp", "Kafka message format of unicast_prefix / router / peer : openbmp (v1.7, tab separated) or json (one JSON object per line). bmp_raw is unchanged")
-	optRIB       = flag.Bool("rib", true, "keep per-peer route tables in memory (route counts, prefix lookup API). false = forward only, much less memory")
+	optRIB       = flag.String("rib", defaultRIB, "address families to keep route tables for (route counts, prefix lookup API) : list such as ipv4-unicast,ipv6-unicast,vpnv4, or all, none (= false : forward only, much less memory), true (= ipv4-unicast,ipv6-unicast)")
 	optRaw       = flag.Bool("raw", true, "tcp : forward received BMP unchanged to <prefix without .parsed>.bmp_raw (openbmp.parsed -> openbmp.bmp_raw)")
 	optCHash     = flag.String("chash", "", "tcp : C_HASH_ID in message headers (32 hex digits). Empty = md5(host name), like openbmpd without admin_id")
 	optLock      = flag.String("lock", "", "lock file (if another instance holds it : log one line and exit)")
@@ -82,6 +82,7 @@ var (
 	optUpgrade = flag.Bool("upgrade", false, "hand the running collector (pid in the lock file) over to the binary now at its path, without dropping router sessions (SIGUSR2)")
 	optResume  = flag.String("resume", "", "internal : state file from the old process (set by the handover exec)")
 	optHOCheck = flag.Bool("handover-check", false, "internal : print the handover state format and exit")
+	optHOForms = flag.Bool("handover-formats", false, "internal : print the handover state formats this binary reads and exit")
 )
 
 // confApplied : 시작 때 설정 파일에서 넣은 항목 (기록용)
@@ -94,6 +95,10 @@ func main() {
 	flag.Parse()
 	if *optHOCheck {
 		handoverCheck()
+		return
+	}
+	if *optHOForms {
+		handoverFormats()
 		return
 	}
 	exePath, _ = os.Executable() // 판 올리기 : 같은 경로의 (새) 파일을 exec
@@ -158,6 +163,9 @@ func main() {
 	}
 }
 
+// ribFams : -rib 를 해석한 것 (checkOpts 가 채움)
+var ribFams map[family]bool
+
 // checkOpts : 옵션 검사. 운영 토픽 (openbmp.parsed.*) 은 tcp 입력일 때만 허용
 func checkOpts() error {
 	if _, err := parseHTTPAllow(*optHTTPOK); err != nil {
@@ -165,6 +173,10 @@ func checkOpts() error {
 	}
 	if *optParts < 1 || *optParts > 1000 || *optRepl < 1 || *optRepl > 10 || *optRetention < time.Minute {
 		return fmt.Errorf("-partitions 1 to 1000, -replication 1 to 10, -retention at least 1m")
+	}
+	var err error
+	if ribFams, err = parseRIBFamilies(*optRIB); err != nil {
+		return err
 	}
 	if *optFormat != "openbmp" && *optFormat != "json" {
 		return fmt.Errorf("-format %q : openbmp or json", *optFormat)
@@ -259,7 +271,7 @@ func run() error {
 	}()
 	c := newCollector(collectorHash(*optCHash))
 	c.keyBuckets = *optBucket
-	c.noRIB = !*optRIB
+	c.setRIB(ribFams)
 	c.json = *optFormat == "json"
 	c.rules, c.prefix, c.tokenPath = rl, *optPrefix, *optToken
 	hs := resumeState
@@ -405,10 +417,18 @@ func runFile(inPath, outPrefix string) (*collector, error) {
 		if c == nil {
 			c = newCollector(raw.cHash)
 			c.keyBuckets = *optBucket
-			c.noRIB = !*optRIB
+			c.setRIB(ribFams)
 			c.json = *optFormat == "json"
 		}
 		for _, m := range c.handle(raw.routerIP, raw.routerHash, raw.body, d.ts) {
+			if outs[m.kind] == nil { // 경로 종류 토픽 (0.3.0) : 처음 나올 때 파일을 엶
+				w, err := openDumpOut(outPrefix, m.kind)
+				if err != nil {
+					return nil, err
+				}
+				defer w.Flush()
+				outs[m.kind] = w
+			}
 			writeDump(outs[m.kind], &dumpRecord{offset: offset[m.kind], ts: d.ts, key: []byte(m.key), value: m.value})
 			offset[m.kind]++
 			if pipe {
@@ -420,6 +440,18 @@ func runFile(inPath, outPrefix string) (*collector, error) {
 		c.logStat(nil)
 	}
 	return c, nil
+}
+
+// openDumpOut : 파일 입력의 출력 파일 하나 (none 이면 버림). 경로 종류 토픽용 (닫기는 끝날 때 OS 가)
+func openDumpOut(outPrefix, kind string) (*bufio.Writer, error) {
+	if outPrefix == "none" {
+		return bufio.NewWriter(io.Discard), nil
+	}
+	fo, err := os.Create(outPrefix + "." + kind + ".dump")
+	if err != nil {
+		return nil, err
+	}
+	return bufio.NewWriterSize(fo, 1<<20), nil
 }
 
 // rawMsg : openbmp.bmp_raw 메시지 (머리 V / C_HASH_ID / R_HASH / R_IP / L + 빈 줄 + BMP 바이트)

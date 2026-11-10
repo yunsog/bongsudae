@@ -31,22 +31,24 @@ func ribDigest(ps []*peer) (sum [4]uint64, n int) {
 		ab := func(h unique.Handle[pathAttr]) []byte {
 			b, ok := attrHash[h]
 			if !ok {
-				b = appendAttr(nil, h.Value())
+				b = appendAttr(nil, h.Value(), stateVersion)
 				attrHash[h] = b
 			}
 			return b
 		}
-		for k, rt := range p.rib4 {
+		for k, x := range inPre(p).rib4.all() {
 			b := binary.LittleEndian.AppendUint64([]byte(p.key+"4"), uint64(k))
-			b = binary.LittleEndian.AppendUint32(b, rt.t)
-			add(sha256.Sum256(append(b, ab(rt.a)...)))
+			b = binary.LittleEndian.AppendUint32(b, x.rt.t)
+			b = binary.LittleEndian.AppendUint32(b, x.id)
+			add(sha256.Sum256(append(b, ab(x.rt.a)...)))
 		}
-		for k, rt := range p.rib6 {
+		for k, x := range inPre(p).rib6.all() {
 			b := binary.LittleEndian.AppendUint64([]byte(p.key+"6"), k.hi)
 			b = binary.LittleEndian.AppendUint64(b, k.lo)
 			b = append(b, k.n)
-			b = binary.LittleEndian.AppendUint32(b, rt.t)
-			add(sha256.Sum256(append(b, ab(rt.a)...)))
+			b = binary.LittleEndian.AppendUint32(b, x.rt.t)
+			b = binary.LittleEndian.AppendUint32(b, x.id)
+			add(sha256.Sum256(append(b, ab(x.rt.a)...)))
 		}
 	}
 	return
@@ -60,24 +62,24 @@ func TestStateRIBRoundTrip(t *testing.T) {
 	mk := func(key string) *peer { return &peer{key: key, ipStr: key} }
 	ps := []*peer{mk("empty"), mk("v4"), mk("v6"), mk("both")}
 	pfx := netip.MustParsePrefix
-	ps[1].rib4 = map[key4]route{}
 	for i := range 1000 {
 		a := netip.AddrFrom4([4]byte{198, 51, byte(i >> 8), byte(i)})
-		ps[1].rib4[k4(a, 32)] = route{a1, uint32(1793160000 + i)}
+		inPre(ps[1]).rib4.set(k4(a, 32), route{a1, uint32(1793160000 + i)})
 	}
-	ps[2].rib6 = map[key6]route{k6(pfx("2001:db8:1::/48").Addr(), 48): {a2, 7}}
-	ps[3].rib4 = map[key4]route{k4(pfx("0.0.0.0/0").Addr(), 0): {a2, 1}, k4(pfx("203.0.113.0/24").Addr(), 24): {a1, 2}}
-	ps[3].rib6 = map[key6]route{k6(pfx("::/0").Addr(), 0): {a1, 3}}
+	inPre(ps[2]).rib6.set(k6(pfx("2001:db8:1::/48").Addr(), 48), route{a2, 7})
+	inPre(ps[3]).rib4.set(k4(pfx("0.0.0.0/0").Addr(), 0), route{a2, 1})
+	inPre(ps[3]).rib4.set(k4(pfx("203.0.113.0/24").Addr(), 24), route{a1, 2})
+	inPre(ps[3]).rib6.set(k6(pfx("::/0").Addr(), 0), route{a1, 3})
 	want, wn := ribDigest(ps)
 
 	path := filepath.Join(t.TempDir(), "state")
 	f, _ := os.Create(path)
-	if _, err := writeRIBs(f, ps); err != nil {
+	if _, err := writeRIBs(f, ps, stateVersion); err != nil {
 		t.Fatal(err)
 	}
 	f.Close()
 	got := []*peer{mk("empty"), mk("v4"), mk("v6"), mk("both")}
-	got[0].rib4 = map[key4]route{1: {}} // 읽기 전에 있던 것은 없어져야 함
+	inPre(got[0]).rib4.set(1, route{}) // 읽기 전에 있던 것은 없어져야 함
 	f, _ = os.Open(path)
 	defer f.Close()
 	if err := readRIBs(bufio.NewReader(f), len(got), decodeInto(got)); err != nil {
@@ -86,8 +88,8 @@ func TestStateRIBRoundTrip(t *testing.T) {
 	if d, n := ribDigest(got); d != want || n != wn {
 		t.Fatalf("digest differs: %d routes vs %d", n, wn)
 	}
-	if len(got[0].rib4) != 0 || got[1].rib4 == nil || got[1].rib6 != nil {
-		t.Fatalf("maps: %v %v %v", got[0].rib4, got[1].rib4 == nil, got[1].rib6)
+	if inPre(got[0]).rib4.size() != 0 || inPre(got[1]).rib4.m == nil || inPre(got[1]).rib6.m != nil {
+		t.Fatalf("maps: %v %v %v", inPre(got[0]).rib4.m, inPre(got[1]).rib4.m == nil, inPre(got[1]).rib6.m)
 	}
 
 	// 잘린 파일 : 어디서 잘려도 panic 없이 오류
@@ -102,7 +104,11 @@ func TestStateRIBRoundTrip(t *testing.T) {
 
 // decodeInto : 덩어리 i -> ps[i] 경로표
 func decodeInto(ps []*peer) func(int, []byte) error {
-	return func(i int, b []byte) error { return ps[i].decodeRIB(b) }
+	return func(i int, b []byte) error {
+		tabs, _, err := decodeRIB(b, stateVersion, viewInPre)
+		ps[i].views = tabs
+		return err
+	}
 }
 
 type cutReader struct{ b []byte }
@@ -159,7 +165,7 @@ func TestStateRIBDump(t *testing.T) {
 		t.Fatal(err)
 	}
 	w := bufio.NewWriterSize(f, 1<<20)
-	size, err := writeRIBs(w, ps)
+	size, err := writeRIBs(w, ps, stateVersion)
 	if err == nil {
 		err = w.Flush()
 	}

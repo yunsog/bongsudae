@@ -59,12 +59,14 @@ type attrs struct {
 
 // update : UPDATE 하나를 나눈 결과
 type update struct {
-	attrs  attrs
-	v4Add  []prefix
-	v4Del  []prefix
-	v6Add  []prefix
-	v6Del  []prefix
-	others int // unicast 가 아닌 MP_REACH / UNREACH 수 (VPN, EVPN 등 : 세고 버림)
+	attrs     attrs
+	v4Add     []prefix
+	v4Del     []prefix
+	v6Add     []prefix
+	v6Del     []prefix
+	others    int         // 해석기가 없는 종류의 MP_REACH / UNREACH 수 (VPN, EVPN 등 : 세고 버림)
+	otherFams []family    // 그 종류들 (하나씩, 같은 것 여럿 가능. 보통 nil)
+	fams      []famUpdate // unicast 밖 해석하는 종류 (labeled unicast, L3VPN, multicast : famroute.go, 보통 nil)
 
 	eorV4, eorV6 bool // End-of-RIB (RFC 4724) : 처음 전체 전송이 끝났다는 표시
 }
@@ -74,6 +76,23 @@ type pathOpts struct {
 	as4       bool // AS_PATH 의 AS 가 4 바이트
 	addPathV4 bool // IPv4 unicast NLRI 앞에 path id
 	addPathV6 bool
+	addPaths  []family // 그 밖 종류 중 Add-Path 로 받는 것 (0.3.0, peer.addPathFams)
+}
+
+// addPathFor : 종류 f 의 NLRI 앞에 path id 가 있는가
+func (o pathOpts) addPathFor(f family) bool {
+	for _, x := range o.addPaths {
+		if x == f {
+			return true
+		}
+	}
+	return false
+}
+
+// other : 해석기가 없는 종류의 MP_REACH / UNREACH 하나 (세고 버림)
+func (u *update) other(f family) {
+	u.others++
+	u.otherFams = append(u.otherFams, f)
 }
 
 // parseUpdate : UPDATE 몸통 (BGP 머리 뒤)
@@ -445,7 +464,7 @@ func largeCommString(v []byte) string {
 	return strings.Join(s, " ")
 }
 
-// parseMPReach : afi 2 + safi 1 + next hop 길이 1 + next hop + 예약 1 + NLRI
+// parseMPReach : afi 2 + safi 1 + next hop 길이 1 + next hop + 예약 1 + NLRI. 해석은 경로 종류의 해석기 (family.go)
 func parseMPReach(v []byte, o pathOpts, u *update) error {
 	if len(v) < 5 {
 		return errShort
@@ -454,54 +473,25 @@ func parseMPReach(v []byte, o pathOpts, u *update) error {
 	if 4+nl+1 > len(v) {
 		return fmt.Errorf("mp_reach next hop length %d", nl)
 	}
-	if safi != safiUnicast || (afi != afiIPv4 && afi != afiIPv6) {
-		u.others++
+	f := famOf(afi, safi)
+	ps, ok := nlriParsers[f]
+	if !ok {
+		u.other(f)
 		return nil
 	}
-	nh := v[4 : 4+nl]
-	switch {
-	case nl >= 16: // IPv6 global (+ link-local 16) : 앞 16 바이트
-		u.attrs.mpNextHop = netip.AddrFrom16([16]byte(nh[:16])).String()
-	case nl >= 4:
-		u.attrs.mpNextHop = netip.AddrFrom4([4]byte(nh[:4])).String()
-	}
-	nlri := v[4+nl+1:]
-	var err error
-	if afi == afiIPv6 {
-		var p []prefix
-		p, err = parseNLRI(nlri, afiIPv6, o.addPathV6)
-		u.v6Add = append(u.v6Add, p...)
-	} else {
-		var p []prefix
-		p, err = parseNLRI(nlri, afiIPv4, o.addPathV4)
-		u.v4Add = append(u.v4Add, p...)
-	}
-	return err
+	return ps.reach(u, v[4:4+nl], v[4+nl+1:], o)
 }
 
-// parseMPUnreach : afi 2 + safi 1 + 철회 NLRI
+// parseMPUnreach : afi 2 + safi 1 + 철회 NLRI (없으면 그 종류의 End-of-RIB)
 func parseMPUnreach(v []byte, o pathOpts, u *update) error {
 	if len(v) < 3 {
 		return errShort
 	}
-	afi, safi := be16(v), v[2]
-	if safi != safiUnicast || (afi != afiIPv4 && afi != afiIPv6) {
-		u.others++
+	f := famOf(be16(v), v[2])
+	ps, ok := nlriParsers[f]
+	if !ok {
+		u.other(f)
 		return nil
 	}
-	if len(v) == 3 { // 철회할 것이 없는 MP_UNREACH = 그 종류의 End-of-RIB
-		u.eorV4, u.eorV6 = u.eorV4 || afi == afiIPv4, u.eorV6 || afi == afiIPv6
-		return nil
-	}
-	var err error
-	if afi == afiIPv6 {
-		var p []prefix
-		p, err = parseNLRI(v[3:], afiIPv6, o.addPathV6)
-		u.v6Del = append(u.v6Del, p...)
-	} else {
-		var p []prefix
-		p, err = parseNLRI(v[3:], afiIPv4, o.addPathV4)
-		u.v4Del = append(u.v4Del, p...)
-	}
-	return err
+	return ps.unreach(u, v[3:], o)
 }

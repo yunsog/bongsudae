@@ -4,6 +4,9 @@
 // 보호 :
 //   - 허용 대역 밖 주소는 바로 끊음
 //   - 첫 메시지는 firstWait 안에 와야 하고 BMP v3 Initiation 이어야 함 (스캐너는 여기서 끊김)
+//   - 연결 자리 (11-05, connSlots) : Initiation 전 연결은 전체 maxPending, 주소마다 pendingPerIP 까지,
+//     Initiation 을 보낸 연결 (라우터) 은 maxRouters 까지. 전에는 둘이 한 자리 (200) 를 함께 써서
+//     스캐너가 Initiation 전 연결로 자리를 채우면 다시 붙으려는 라우터가 들어오지 못했음
 //   - 머리의 길이가 bmpMaxLen 보다 크거나 버전이 3 이 아니면 그 연결만 끊음
 //   - 읽기 쪽 panic 은 그 연결만, 처리 쪽 panic 은 그 메시지만 (safeProcess)
 //   - Kafka 버퍼가 차면 그 라우터의 읽기가 멈춤 -> TCP 가 라우터를 늦춤 (버리지 않음)
@@ -37,10 +40,13 @@ import (
 )
 
 const (
-	firstWait = 30 * time.Second // 연결 뒤 첫 메시지를 기다리는 시간
+	firstWait = 10 * time.Second // 연결 뒤 첫 메시지를 기다리는 시간 (11-05 30 -> 10 초 : 라우터는 연결 0.3 ms 뒤 Initiation, pcap 확인)
 	keepAlive = 60 * time.Second // TCP keepalive (BMP 는 조용할 수 있어 읽기 시간 제한은 두지 않음)
-	maxConns  = 200              // 동시 연결 상한
-	resetGap  = 10 * time.Minute // 같은 라우터를 다시 끊을 수 있는 간격 (전체 경로를 다시 받는 부담)
+
+	maxRouters   = 2000             // Initiation 을 보낸 연결 (라우터) 상한 (11-05, 전 maxConns 200 = Initiation 전 연결과 함께)
+	maxPending   = 64               // Initiation 전 연결 상한 (전체)
+	pendingPerIP = 4                // Initiation 전 연결 상한 (주소마다, 11-05 사용자)
+	resetGap     = 10 * time.Minute // 같은 라우터를 다시 끊을 수 있는 간격 (전체 경로를 다시 받는 부담)
 
 	shutdownWait = 10 * time.Second // 끝낼 때 라우터 goroutine 을 기다리는 시간 (+ Kafka Flush 30 초 < systemd 60 초)
 )
@@ -174,6 +180,40 @@ func allowed(list []netip.Prefix, a netip.Addr) bool {
 	return false
 }
 
+// denyLog : 받지 않고 끊은 연결 기록 (0.3.0 허용 대역 밖, 11-05 자리 없음). 주소마다 1 분에 한 줄 (스캐너가 많이 붙어도 기록이 늘지 않게),
+// 그 사이 끊은 수는 다음 줄에 "N more". accept goroutine 하나만 부르므로 잠금 없음
+type denyLog struct {
+	last map[netip.Addr]time.Time // 주소 -> 마지막으로 기록한 때
+	more map[netip.Addr]int       // 그 뒤 기록하지 않고 끊은 수
+}
+
+var (
+	denied  = newDenyLog() // 허용 대역 밖
+	crowded = newDenyLog() // Initiation 전 연결 자리 없음 (11-05)
+)
+
+func newDenyLog() *denyLog {
+	return &denyLog{last: map[netip.Addr]time.Time{}, more: map[netip.Addr]int{}}
+}
+
+// note : why = 끊은 이유 (기록 글자)
+func (d *denyLog) note(a netip.Addr, now time.Time, why string) {
+	if t, ok := d.last[a]; ok && now.Sub(t) < time.Minute {
+		d.more[a]++
+		return
+	}
+	if len(d.last) > 10000 { // 주소가 아주 많으면 (흩어진 스캔) 표를 비움
+		clear(d.last)
+		clear(d.more)
+	}
+	extra := ""
+	if n := d.more[a]; n > 0 {
+		extra = fmt.Sprintf(" (%d more since last line)", n)
+	}
+	log.Printf("conn %s refused : %s%s", a, why, extra)
+	d.last[a], d.more[a] = now, 0
+}
+
 // runTCP : 수신 + 처리. ctx 가 끝나면 (SIGTERM) 연결을 모두 정리하고 nil 로 돌아옴 (위 "끝내기"). 오류면 오류로 돌아옴
 // hs 가 있으면 (판 올리기로 시작) listener 와 연결을 옛 판에게서 이어 받음
 func runTCP(ctx context.Context, listen string, allow []netip.Prefix, c *collector, out *producer, hs *handoverState) error {
@@ -212,20 +252,19 @@ func runTCP(ctx context.Context, listen string, allow []netip.Prefix, c *collect
 		}
 	}()
 
-	sem := make(chan struct{}, maxConns) // 동시 연결 수 세마포어
-	var wg sync.WaitGroup                // 라우터 goroutine (끝낼 때 기다림)
-	start := func(cr *connRun) {         // 연결 goroutine 시작. upg 에 먼저 올림 (판 올리기가 빠뜨리지 않게, accept 와 같은 goroutine 에서)
+	var wg sync.WaitGroup        // 라우터 goroutine (끝낼 때 기다림)
+	start := func(cr *connRun) { // 연결 goroutine 시작. upg 에 먼저 올림 (판 올리기가 빠뜨리지 않게, accept 와 같은 goroutine 에서)
 		upg.enter(cr)
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			defer func() { <-sem }()
+			defer slots.release(cr) // 연결 자리 (Initiation 전 / 라우터) 를 돌려줌
 			handleConn(cr, c, out, ct)
 		}()
 	}
-	if hs != nil { // 이어 받은 연결들
+	if hs != nil { // 이어 받은 연결들 : 옛 판에서 이미 받은 연결이라 상한을 보지 않고 자리만 셈
 		for _, cr := range hs.conns(ct) {
-			sem <- struct{}{}
+			slots.resume(cr)
 			start(cr)
 		}
 		hs.resumed()
@@ -246,15 +285,16 @@ func runTCP(ctx context.Context, listen string, allow []netip.Prefix, c *collect
 		ap, _ := netip.ParseAddrPort(conn.RemoteAddr().String())
 		if !allowed(*tcpAllow.Load(), ap.Addr()) {
 			conn.Close()
+			denied.note(ap.Addr().Unmap(), time.Now(), "not in bmp.allow")
 			continue
 		}
-		select {
-		case sem <- struct{}{}:
-			start(newConnRun(conn, ap.Addr().Unmap().String(), nil))
-		default:
-			log.Printf("too many connections, drop %s", ap)
+		cr := newConnRun(conn, ap.Addr().Unmap().String(), nil)
+		if why := slots.admit(cr); why != "" { // Initiation 전 자리 없음 (스캐너가 연결을 많이 열어 둠 등)
 			conn.Close()
+			crowded.note(ap.Addr().Unmap(), time.Now(), why)
+			continue
 		}
+		start(cr)
 	}
 }
 
@@ -286,6 +326,101 @@ type connRun struct {
 	n     int       // 받은 메시지 수 (0 = Initiation 전)
 	gen   uint64    // 이 연결의 번호 (connStart, 이어 받은 연결은 옛 판의 번호 그대로)
 	until time.Time // Initiation 전 : 첫 메시지를 기다리는 끝 시각
+	slot  int       // 잡은 연결 자리 (slotNone / slotPending / slotRouter, connSlots)
+}
+
+// 연결 자리 종류 (connRun.slot)
+const (
+	slotNone    = iota
+	slotPending // Initiation 전
+	slotRouter  // Initiation 을 보냄
+)
+
+// connSlots : 연결 자리 (11-05). Initiation 전 연결은 전체 maxPending, 주소마다 pendingPerIP 까지,
+// Initiation 을 보낸 연결 (라우터) 은 maxRouters 까지. accept goroutine (admit, resume) 과 연결 goroutine (promote, release) 이 부름
+type connSlots struct {
+	mu      sync.Mutex
+	pending int            // Initiation 전 연결 수
+	byIP    map[string]int // 주소 -> Initiation 전 연결 수
+	routers int            // Initiation 을 보낸 연결 수
+}
+
+var slots = &connSlots{byIP: map[string]int{}}
+
+// admit : 새 연결에 Initiation 전 자리를 줌. 자리가 없으면 그 이유 (기록 글자), 있으면 ""
+func (s *connSlots) admit(cr *connRun) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.pending >= maxPending {
+		return fmt.Sprintf("%d connections already waiting for initiation (all addresses)", maxPending)
+	}
+	if s.byIP[cr.ip] >= pendingPerIP {
+		return fmt.Sprintf("%d connections from this address already waiting for initiation", pendingPerIP)
+	}
+	s.addPending(cr)
+	return ""
+}
+
+// promote : Initiation 을 받음 = Initiation 전 자리를 돌려주고 라우터 자리를 잡음. 라우터 자리가 없으면 false
+func (s *connSlots) promote(cr *connRun) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.routers >= maxRouters {
+		return false
+	}
+	s.dropPending(cr)
+	s.routers++
+	cr.slot = slotRouter
+	return true
+}
+
+// resume : 판 올리기로 이어 받은 연결의 자리를 셈 (상한은 보지 않음 : 옛 판이 이미 받은 연결)
+func (s *connSlots) resume(cr *connRun) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if cr.n == 0 {
+		s.addPending(cr)
+		return
+	}
+	s.routers++
+	cr.slot = slotRouter
+}
+
+// release : 연결이 끝남 = 잡은 자리를 돌려줌 (두 번 불러도 됨)
+func (s *connSlots) release(cr *connRun) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	switch cr.slot {
+	case slotPending:
+		s.dropPending(cr)
+	case slotRouter:
+		s.routers--
+	}
+	cr.slot = slotNone
+}
+
+// counts : 지금 Initiation 전 / 라우터 연결 수 (시험, 기록)
+func (s *connSlots) counts() (pending, routers int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.pending, s.routers
+}
+
+func (s *connSlots) addPending(cr *connRun) { // s.mu 안에서
+	s.pending++
+	s.byIP[cr.ip]++
+	cr.slot = slotPending
+}
+
+func (s *connSlots) dropPending(cr *connRun) { // s.mu 안에서, cr 이 Initiation 전 자리를 잡고 있을 때만 줄임
+	if cr.slot != slotPending {
+		return
+	}
+	s.pending--
+	if s.byIP[cr.ip]--; s.byIP[cr.ip] <= 0 {
+		delete(s.byIP, cr.ip)
+	}
+	cr.slot = slotNone
 }
 
 func newConnRun(conn net.Conn, ip string, pending []byte) *connRun {
@@ -335,6 +470,10 @@ func handleConn(cr *connRun, c *collector, out *producer, ct *connTable) {
 		if cr.n == 0 {
 			if msg[5] != bmpInit {
 				log.Printf("conn %s: first message type %d (not initiation), drop", ip, msg[5])
+				return
+			}
+			if !slots.promote(cr) {
+				log.Printf("conn %s: initiation, but already %d routers connected (maxRouters), drop", ip, maxRouters)
 				return
 			}
 			conn.SetReadDeadline(time.Time{}) // 이제부터 시간 제한 없음

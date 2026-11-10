@@ -11,11 +11,15 @@ The running collector serves this document itself at `GET /api/doc`
   or `:5001` (all interfaces). The API is off when this is empty.
 - Access control: use a host firewall. In addition, `-http-allow` (config `http.allow`) can list allowed
   addresses / prefixes (comma separated); requests from anywhere else get 403. Empty = allow all.
-- Responses: JSON (UTF-8, indented). Errors are a single line of `text/plain` plus a status code.
+- Responses: JSON (UTF-8, indented; prefix search (GET / POST `.../prefix`) is streamed with one route per line). Errors are a single line of `text/plain` plus a status code.
 - Times: RFC 3339 in the server's local time zone, e.g. `2026-10-29T14:52:36+09:00`. Missing times are `""`.
 - Addresses: IPv4 `192.0.2.20`, IPv6 in canonical form `2001:db8::20:63`. Put them in the path as they are
   (`:` does not need escaping).
-- At most 4 requests are processed at once; further requests wait. Large lists can take a few seconds.
+- Concurrency: at most 4 requests that scan route tables (`.../prefixes` lists, `.../prefix` search) and 16 others
+  (status, stats, /metrics, rules, reset) run at once. A request that cannot get a slot within 5 seconds gets **503**
+  with `Retry-After: 5`. Large lists can take a few seconds.
+- Timeouts: the request (headers and body) must arrive within 30 seconds. The response keeps going as long as the client
+  reads it; a client that reads nothing for 1 minute is disconnected (long `format=text` downloads still finish).
 
 Contents: 1. Concepts, 2. Routers and collector status, 3. Peers, 4. Routes (prefixes),
 5. Kafka forwarding rules, 6. Errors, 7. Command-line client, 8. Notes for integrators.
@@ -119,6 +123,8 @@ last 60 minutes, plus release, memory and Kafka state. History is lost when the 
 | minutes | Oldest first, at most 60 entries. `time` = end of that minute, `routers` = known routers (including down) |
 | counts | BMP type counts (`route_mon`, `peer_up`, ...) are omitted when zero; the other keys are always present |
 | raw | Messages sent to the bmp_raw topic in that minute (tcp input only) |
+| counts.family_rows | (0.3.0+) address family rows (labeled_unicast_prefix, l3vpn, multicast_prefix, evpn, flowspec) produced in that minute |
+| other_families | (0.3.0+, omitted when none) MP_REACH / MP_UNREACH dropped per address family that is not parsed, e.g. `{"bgp-ls": 12, "rt-constraint": 3}` (a split of counts.others) |
 | kafka_fail_total | Produce failures since start, as of that minute |
 | topics | Messages / rows per unicast_prefix topic (forwarding rules): `{"msgs": N, "rows": N}` (0.1 used the keys `Msgs` / `Rows`) |
 | handover | (0.2.0+, tcp input only = this release can do a hitless upgrade; missing = 0.1, `-upgrade` will not work) supported, count (upgrades since the last restart), last_at / from (time of the last upgrade and the release it came from), pause_ms (how long reading from routers was paused), rib_loading (route tables still loading in the background: route counts / lookups are incomplete), rib_load_ms, last_error / last_error_at (why the last attempt gave up; the old process kept running). `bongsudae -upgrade` reads this |
@@ -149,6 +155,7 @@ Scrape config example: `scrape_configs: [{job_name: bongsudae, static_configs: [
 | bongsudae_rows_not_sent_total | counter | | rows not sent because of forwarding rules |
 | bongsudae_kafka_messages_total | counter | kind | produced messages (`unicast_prefix`, `router`, `peer`, `bmp_raw`) |
 | bongsudae_other_afi_total | counter | | MP_REACH / MP_UNREACH of other address families (counted, dropped) |
+| bongsudae_other_family_total | counter | family | (0.3.0+) the same per address family (`bgp-ls`, `rt-constraint` ...) |
 | bongsudae_kafka_fails_total | counter | | Kafka produce failures (absent with file input) |
 | bongsudae_kafka_last_ok_time_seconds | gauge | | Unix time of the last successful produce |
 | go_memstats_heap_alloc_bytes, go_memstats_sys_bytes, go_gc_cycles_total, go_goroutines | | | Go runtime (same names as the Prometheus Go client) |
@@ -203,6 +210,10 @@ Peers of all routers (by router, then by peer address). Array. Query parameters 
 | state, since | `up` / `down`, and when it became so |
 | peer_up | Whether a Peer Up was received in the current BMP session (if true, the route count is exact from the start) |
 | synced | Initial table transfer complete = an End-of-RIB was received for every unicast family (IPv4 / IPv6) negotiated by both OPENs. False without a Peer Up or without the OPENs |
+| view | (0.3.0+) The **view** that the route counts, synced, settled, eor, adds, dels and last_update above refer to: the peer's main view (the first view received, in the order below; normally `in-pre`, `loc-rib` for a Loc-RIB peer). Views: `in-pre` (Adj-RIB-In pre-policy, RFC 7854), `in-post` (post-policy), `out-pre` (Adj-RIB-Out pre-policy, RFC 8671), `out-post`, `loc-rib` (RFC 9069), taken from the L / O flags and the Peer Type of the per-peer header |
+| family_routes | (0.3.0+, omitted when none) number of routes per other address family with a route table, e.g. `{"vpnv4": 1200}` (only families listed in `bmp.rib`; none by default) |
+| paths_v4 / paths_v6 | (0.3.0+, only for sessions that negotiated Add-Path, RFC 7911) number of paths. With Add-Path a prefix can have several paths, so this can exceed `routes_v4` (the number of prefixes) |
+| views | (0.3.0+, only when the router sends the same neighbor in two or more views) one entry per view: `{"view", "routes_v4", "routes_v6", "paths_v4", "paths_v6", "synced", "settled", "eor_v4", "eor_v6", "last_update", "adds", "dels"}`. Each view has its own route table, so views never mix |
 | settled | `synced`, or the peer has been up for 5 minutes and no new prefix arrived for 5 minutes (changes and withdrawals do not count). For routers that do not forward End-of-RIB over BMP. Only up peers with a Peer Up. Right after `-upgrade`, peers up for more than 5 minutes are settled at once (the time of the last new prefix is not handed over) |
 | eor_v4 / eor_v6 | When End-of-RIB was received (omitted if not). Observed: 19 s (3,937 messages) and 225 s (5,525 messages) after Peer Up |
 | routes_v4 / routes_v6 | Number of prefixes currently alive |
@@ -237,6 +248,7 @@ One peer plus `"detail"`. 404 if the router or peer is unknown.
 - `pre_policy`, `adj_rib_in`, `as4`: from the per-peer header flags.
 - `sent_caps` = capabilities in the OPEN the router sent, `recv_caps` = capabilities in the OPEN the peer sent.
   Empty if no Peer Up was received (ports and hold times are then 0).
+- `families` / `add_path` (0.3.0+, omitted when empty): address families announced in both OPENs (`ipv4-unicast`, `ipv6-unicast`, `vpnv4`, `l2vpn-evpn` ...) and those received with Add-Path. Bongsudae parses ipv4 / ipv6-unicast, labeled unicast, vpnv4 / vpnv6, multicast and l2vpn-evpn (0.3.0); the others are counted and dropped (`other_families` in /api/stats)
 - `history`: the last 10 events, oldest first: `up (Peer Up)`, `seen in route monitoring (no Peer Up)`,
   `End-of-RIB IPv4 (routes N)`, `End-of-RIB IPv6 (routes N)`, `down : ...`.
 - `bmp_stats` / `bmp_stats_at` (0.2.0+, inside `detail`, omitted if none received): the last BMP Statistics Report (RFC 7854 4.8) the router sent for this peer. Names follow the IANA types (`rejected_prefixes`, `duplicate_prefix_advertisements`, `adj_rib_in_routes`, `loc_rib_routes`, `updates_treat_as_withdraw`, ...); per address family values get `_<afi>_<safi>` (e.g. `adj_rib_in_routes_1_1` = IPv4 unicast); unknown types are `type_N`. Only for known peers (a Stats Report never creates a peer).
@@ -299,6 +311,9 @@ One route row (JSON):
 - Fields with empty strings may be left out of the JSON (communities through aggregator).
 - `as_path` is the AS path text without the leading space used in the Kafka messages.
 - If the path ends with an AS_SET of two or more ASes: `origin_as` is 0 and `origin_as_set` holds the set text (`"{64510,64511}"`). A set of one AS (`{64512}`) gives `origin_as` 64512 and no `origin_as_set` (0.2.0+).
+- (0.3.0+) Routes of an Add-Path session carry `path_id` (the router's path identifier; one row per path of a prefix). Routes of other sessions have no `path_id`. format=text has no path_id column (to keep the column order), so the same prefix appears on several lines
+- (0.3.0+) Address family rows (family=): L3VPN rows carry `rd` (`64496:1`); labeled unicast and L3VPN rows carry `labels` (`16001,3`). Omitted when empty
+  FlowSpec rows carry `rule` (the rule text, `dst 203.0.113.0/24 proto =6`, kafka.md 3.4) and `rd` for VPN. `prefix` = the rule's destination (empty when none); lookups (p=) match the destination prefix
   The set in `as_path` is written `{64510,64511}` as well (RFC style; openbmpd wrote `{ a b }`).
   In `format=text` the origin_as column contains the set text. For the origin filter the origin is "unknown"
   (such rows are kept by `not_origin`).
@@ -312,12 +327,14 @@ All routes of one peer / of one router (all its peers). **Can be very large** (a
 | Parameter | Meaning |
 |---|---|
 | afi=4 / 6 | IPv4 / IPv6 only |
+| view= | (0.3.0+) View `in-pre` / `in-post` / `out-pre` / `out-post` / `loc-rib` (default: the peer's main view). A view never received gives an empty list. Invalid: 400 |
+| family= | (0.3.0+) Address family `vpnv4` / `vpnv6` / `ipv4-labeled` / `ipv6-labeled` / `ipv4-multicast` / `ipv6-multicast` / `ipv4-flowspec` / `ipv6-flowspec` / `vpnv4-flowspec` / `vpnv6-flowspec` (`ipv4-unicast` / `ipv6-unicast` = afi=4 / 6). 409 if that family's route table is off (bmp.rib), 400 for a family without route tables. Rows in (RD, prefix, path_id) order; L3VPN rows carry `rd`, labeled rows `labels` |
 | p= / match= | Filter by prefix / address, with the same meaning as in "Search" below (if p is a prefix the default match is exact, if an address it is longest; `longest` gives one row per peer). match without p is 400 |
 | origin_as=N[,N...] / not_origin=N[,N...] | Origin filter (see "Origin filter" below) |
 | path_as=N[,N...] | Rows whose as_path contains one of these ASes. ASes inside an AS_SET (`{a,b}`) and the origin are part of as_path and match. Rows with an empty as_path (iBGP) never match |
 | offset=N | Skip the first N rows after filtering (order unchanged) |
 | limit=N | Then return at most N rows (a user interface should always set this) |
-| format=text | Tab-separated text (first line = header). For downloads; smaller and faster than JSON |
+| format=text | Tab-separated text (first line = header). For downloads; smaller and faster than JSON. (0.3.0+) With family= set to a non-unicast family, `rd` `labels` `rule` columns are appended (unicast keeps its 15 columns) |
 | distinct=1 | (Router list only) Distinct prefixes and the number of peers that have each: `[{"prefix": "203.0.113.0/24", "peers": 2}]`, in text `prefix\tpeers`. Rows are selected by the filters above (afi, p, origin, path_as), grouped by prefix, and offset / limit apply to the grouped prefixes. X-Total = number of distinct prefixes; X-Applied ends with `distinct` |
 
 - Filter order: afi -> p (match) -> origin_as / not_origin -> path_as -> offset -> limit.
@@ -342,9 +359,11 @@ JSON is an array of route rows (one object per line). Text columns:
 |---|---|
 | p= | Prefix `203.0.113.0/24` or address `203.0.113.10` (an address is taken as /32 or /128 and the default match is longest). Required (missing or invalid = 400) |
 | match= | `exact` (default) that prefix / `longest` the longest prefix covering it (one per peer) / `covering` all prefixes covering it (the prefix itself and shorter ones) / `more` the prefix and all more-specific prefixes inside it |
+| view= | (0.3.0+) View, as above (default: each peer's main view) |
+| family= | (0.3.0+) Address family, as above (409 when off). For L3VPN the prefix is matched in every RD; longest returns the longest per RD |
 | origin_as=N[,N...] | Only these origins |
 | not_origin=N[,N...] | Exclude these origins (hijack check) |
-| limit=N | First N rows only (applied after the filters). Not a number: 400 |
+| limit=N | First N rows only (applied after the filters). Not a number: 400. Absent / 0 = all (within the row cap below) |
 | format=text | Tab-separated text, same columns as the lists. total is in the `X-Total` response header |
 
 ```json
@@ -355,6 +374,10 @@ JSON is an array of route rows (one object per line). Text columns:
 - Hijack check example: `p=<your prefix>&match=more&not_origin=<your AS>` = rows inside your prefix whose origin
   is not your AS.
 - 404 if the router (`/api/routers/{ip}/prefix`) is unknown. `/api/prefix` with no routers yet returns an empty result.
+- **Row cap**: one request holds at most **2,000,000 rows** while searching (all prefixes together). Beyond that it stops
+  at once with **413** (`too many routes (over 2000000 rows held): ...`), e.g. `p=0.0.0.0/0&match=more` without limit over all routers.
+  With a limit, the top rows are kept whenever the cap is reached, so it is not hit (as long as prefixes x limit x 2 stays below the cap).
+  For a whole router use the list download (`/api/routers/{ip}/prefixes?format=text`, streamed, no cap).
 
 ### Origin filter (search, lists and batch search)
 - `origin_as` and `not_origin` cannot be used together (400). ASes are decimal (0 to 4294967295), comma separated.
@@ -369,6 +392,8 @@ JSON is an array of route rows (one object per line). Text columns:
 ### Batch search: POST /api/prefix (all routers), POST /api/routers/{ip}/prefix (one router)
 Many prefixes at once, for example to check all of your registered prefixes. It is a read, so no key is needed.
 It counts as one request against the concurrency limit (4).
+**The header `Content-Type: application/json` is required (415 otherwise)**: browser forms and other "simple" requests
+cannot set it, so a hostile web page cannot send this request through a user's browser.
 
 ```json
 {"p": ["203.0.113.0/24", "2001:db8::/32", "192.0.2.10"], "match": "more", "limit": 100, "not_origin": [64500]}
@@ -377,7 +402,9 @@ It counts as one request against the concurrency limit (4).
 |---|---|
 | p | List of prefixes or addresses, 1 to 5000 (otherwise 400). If any entry is invalid the answer is 400, naming the entry: index (from 0), position (from 1) and the value |
 | match | Same match for all. If absent, each entry uses its default (prefix exact, address longest) |
-| limit | First N rows per prefix (0 / absent = all) |
+| limit | First N rows per prefix (0 / absent = all, within the row cap). Negative: 400 |
+| view | (0.3.0+) View, e.g. `"in-post"` (default: each peer's main view) |
+| family | (0.3.0+) Address family, e.g. `"vpnv4"` (default: unicast) |
 | origin_as / not_origin | As in the origin filter above (arrays of numbers) |
 
 Unknown fields in the body, or a body that is not valid JSON, give 400. The body may be at most 2 MB.
@@ -392,7 +419,10 @@ Response (`results` in request order; a prefix given twice appears twice):
 ```
 - Top-level `count` = sum of the route rows in all results. Each result's `count` / `total` mean the same as in GET.
   Top-level `match` is omitted if it was not given.
-- Each peer's table is scanned only once, for all prefixes together.
+- Each peer's table is scanned only once, for all prefixes together. Identical (prefix, match) entries are searched once
+  and the result is repeated.
+- The row cap (2,000,000, 413) counts all prefixes together. Nested prefixes (e.g. more of `0.0.0.0/0` and `0.0.0.0/1`)
+  count the same route once per prefix.
 - Speed (synthetic test, 4 full-table peers = 4.8 million routes): 5000 prefixes with `more` 1.7 s, `exact` 0.04 s,
   `longest` 0.05 s. A single GET with `more` takes 0.1 to 0.2 s. During a search, processing for each peer waits
   briefly (about 0.4 s for one full-table peer), so run batch searches a few minutes apart at most
@@ -484,9 +514,12 @@ requests are refused with 403.
 | 400 | Invalid value (address, prefix, match, origin_as / not_origin, path_as, offset / limit, as / state of /api/peers, topic name, X-Actor, body, number of p entries), or a failed rules reload |
 | 403 | Wrong key / key file missing or too short. Client address outside `http.allow` |
 | 404 | Unknown router / peer, DELETE of a rule that does not exist, reset of a router that is not connected |
-| 409 | Route list / prefix lookup while route tables are off (`-rib=false`, 0.2.0+). The rules file was edited by hand and not yet reloaded -> reload first. Reset called when the input is not tcp |
+| 409 | Route list / prefix lookup while route tables are all off (`-rib=none`, which is the 0.2 `-rib=false`; 0.2.0+. From 0.3.0 families can be switched off one by one: then the family is missing and the peer has a warning instead of a 409). The rules file was edited by hand and not yet reloaded -> reload first. Reset called when the input is not tcp |
+| 413 | Prefix search exceeded the row cap (2,000,000) -> add a limit, use a narrower prefix, or download a router's list |
+| 415 | POST /api/prefix without `Content-Type: application/json` |
 | 429 | Reset of the same router again within 10 minutes (see the Retry-After header) |
 | 500 | Writing the rules file / creating a topic failed |
+| 503 | No request slot within 5 seconds (see Retry-After) -> try again shortly |
 
 The body is a one-line, human-readable reason (it can be shown to users as is).
 

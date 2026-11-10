@@ -34,9 +34,8 @@ func TestHandoverFields(t *testing.T) {
 		[]string{"mu", "byID", "stat", "sink", "enc"}) // byID = 찾을 때 다시 채움, stat = 판 올리기 직전에 기록하고 0, sink / enc = 줄 버퍼
 	check(peer{}, []string{"key", "ip", "ipStr", "rd", "typ", "flags", "as", "bgpID", "bgpIDRaw", "bmpStats", "bmpStatsAt", "up", "gotUp",
 		"noOpen", "since", "localIP", "localPort", "rmtPort", "holdSent", "holdRecv", "sentCaps", "recvCaps", "addPathV4", "addPathV6",
-		"famV4", "famV6", "eorV4", "eorV6", "lastUpdate", "adds", "dels", "downReason", "hist", "rib4", "rib6"},
-		[]string{"ribWait", "ribLog", // 새 판에서만 쓰는 것
-			"grewAt"}) // settled 용. 넘기면 상태 파일 판이 올라 0.2.0-dev (d52a3fd) 에서 -upgrade 를 못 함 -> 넘기지 않음 (새 판에서 0 = 5 분 넘게 up 이면 바로 settled)
+		"famV4", "famV6", "fams", "addPathFams", "downReason", "hist", "views"},
+		[]string{"ribWait", "ribLog"}) // 새 판에서만 쓰는 것 (0.3.0 : 보기마다 수 / 경로표 = views, 상태 형식 2 가 넘김)
 }
 
 // testRouterState : 칸마다 0 이 아닌 값 (빠뜨리면 왕복 비교에서 보임)
@@ -56,12 +55,14 @@ func testCollector() *collector {
 		p.up, p.gotUp, p.noOpen, p.since = true, true, true, now
 		p.localIP, p.localPort, p.rmtPort, p.holdSent, p.holdRecv = "192.0.2.1", 179, 1000, 90, 180
 		p.sentCaps, p.recvCaps, p.addPathV4, p.addPathV6, p.famV4, p.famV6 = "a", "b", true, true, true, true
-		p.eorV4, p.eorV6, p.lastUpdate, p.adds, p.dels, p.downReason = now, now, now, 9, 8, "why"
+		p.fams, p.addPathFams = []family{famOf(afiIPv4, 1), famOf(afiIPv4, 128)}, []family{famOf(afiIPv4, 1)}
+		rv := inPre(p)
+		rv.eorV4, rv.eorV6, rv.lastUpdate, rv.adds, rv.dels, rv.grewAt, p.downReason = now, now, now, 9, 8, 7, "why"
 		p.addEvent(now, "up")
 		u := &update{attrs: attrs{asPath: a.asPath, originAS: a.originAS, nextHop: a.nextHop, origin: a.origin, med: a.med, localPref: a.localPref}}
 		u.v4Add = []prefix{{addr: netip.MustParseAddr("203.0.113.0"), length: 24}}
 		u.v6Add = []prefix{{addr: netip.MustParseAddr("2001:db8:1::"), length: 48}}
-		p.apply(u, now)
+		p.apply(viewInPre, u, now, allOn)
 	}
 	c.seq.Store(12345)
 	return c
@@ -94,8 +95,8 @@ func TestHandoverStateRoundTrip(t *testing.T) {
 	}
 	ps := allPeers(c2)
 	for i, p := range ps {
-		if !reflect.DeepEqual(savePeer(p), savePeer(wantPeers[i])) || !p.ribWait {
-			t.Fatalf("peer %d\n got  %+v\n want %+v", i, savePeer(p), savePeer(wantPeers[i]))
+		if !reflect.DeepEqual(savePeer(p, stateVersion), savePeer(wantPeers[i], stateVersion)) || !p.ribWait {
+			t.Fatalf("peer %d\n got  %+v\n want %+v", i, savePeer(p, stateVersion), savePeer(wantPeers[i], stateVersion))
 		}
 	}
 	// 경로표를 읽기 전에 온 UPDATE : 하나는 더하고 하나는 지움 -> 읽은 뒤에 적용되어야 함
@@ -103,9 +104,9 @@ func TestHandoverStateRoundTrip(t *testing.T) {
 	u := &update{attrs: attrs{asPath: " 64511", originAS: 64511, origin: "igp"}}
 	u.v4Add = []prefix{{addr: netip.MustParseAddr("198.51.100.0"), length: 24}}
 	u.v4Del = []prefix{{addr: netip.MustParseAddr("203.0.113.0"), length: 24}}
-	p0.apply(u, time.Unix(1793160100, 0))
-	if len(p0.rib4) != 0 || len(p0.ribLog) != 1 {
-		t.Fatalf("while loading : rib4 %d log %d", len(p0.rib4), len(p0.ribLog))
+	p0.apply(viewInPre, u, time.Unix(1793160100, 0), allOn)
+	if inPre(p0).rib4.size() != 0 || len(p0.ribLog) != 1 {
+		t.Fatalf("while loading : rib4 %d log %d", inPre(p0).rib4.size(), len(p0.ribLog))
 	}
 	// 두 번째 peer 는 그 사이 새 세션 (Peer Up) : 읽은 경로표는 버려야 함
 	ps[1].clearRIB()
@@ -113,10 +114,10 @@ func TestHandoverStateRoundTrip(t *testing.T) {
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
 		t.Fatal("state file must be removed after loading")
 	}
-	if ribLoading.Load() || p0.ribWait || len(p0.rib4) != 1 || len(p0.rib6) != 1 || len(ps[1].rib4)+len(ps[1].rib6) != 0 {
-		t.Fatalf("after load : p0 %d/%d wait %v, p1 %d", len(p0.rib4), len(p0.rib6), p0.ribWait, len(ps[1].rib4))
+	if ribLoading.Load() || p0.ribWait || inPre(p0).rib4.size() != 1 || inPre(p0).rib6.size() != 1 || inPre(ps[1]).rib4.size()+inPre(ps[1]).rib6.size() != 0 {
+		t.Fatalf("after load : p0 %d/%d wait %v, p1 %d", inPre(p0).rib4.size(), inPre(p0).rib6.size(), p0.ribWait, inPre(ps[1]).rib4.size())
 	}
-	if _, ok := p0.rib4[k4(netip.MustParseAddr("198.51.100.0"), 24)]; !ok {
+	if inPre(p0).rib4.lookup(k4(netip.MustParseAddr("198.51.100.0"), 24)) == nil { // testCollector 의 peer 는 Add-Path
 		t.Fatal("deferred add not applied")
 	}
 	// 미뤄 둔 것이 없는 경우는 원래와 똑같음

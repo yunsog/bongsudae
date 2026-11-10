@@ -44,7 +44,8 @@ import (
 
 const (
 	stateMagic   = "bongsudae-handover\n" // 상태 파일 첫 줄
-	stateVersion = 1                      // 상태 파일 형식 판 : 칸을 바꾸면 올림 (옛 판과 새 판이 다르면 판 올리기를 하지 않음)
+	stateVersion = 2                      // 이 판이 쓰는 상태 파일 형식 판 : 칸을 바꾸면 올림 (1 = 0.2, 2 = 0.3 보기마다 경로표)
+	stateOldest  = 1                      // 이 판이 읽는 가장 옛 형식 (0.2 -> 0.3 도 무중단)
 	pauseWait    = 10 * time.Second       // 연결이 모두 멈추기를 기다리는 시간 (넘으면 그만두고 이어 읽음)
 	flushWait    = 20 * time.Second       // Kafka 에 남은 것을 보내는 시간
 	checkWait    = 30 * time.Second       // 새 실행 파일 확인 (-handover-check, -t) 시간
@@ -72,6 +73,7 @@ type upgrader struct {
 	resume  chan struct{} // 판 올리기를 그만두면 닫음 (멈춘 goroutine 이 깨어남)
 	changed chan struct{} // park / leave 때 알림 (waitParked 가 기다림)
 	busy    atomic.Bool   // 판 올리기 하는 중 (한 번에 하나)
+	format  int           // 이번 판 올리기에 쓸 상태 형식 (checkNewBinary 가 새 실행 파일이 읽는 것 중에서 고름)
 
 	info handoverJSON // /api/stats 의 handover (mu 로 보호)
 }
@@ -255,10 +257,12 @@ func (u *upgrader) upgrade() {
 		return
 	}
 	log.Printf("handover: start (SIGUSR2), checking %s", exePath)
-	if err := checkNewBinary(); err != nil {
+	format, err := checkNewBinary()
+	if err != nil {
 		u.fail(err)
 		return
 	}
+	u.format = format
 	u.fail(u.handover())
 }
 
@@ -270,21 +274,40 @@ func (u *upgrader) fail(err error) {
 	u.mu.Unlock()
 }
 
-// checkNewBinary : 새 실행 파일이 같은 상태 형식을 알고, 지금 설정을 받아들이는지
-func checkNewBinary() error {
+// checkNewBinary : 새 실행 파일이 읽는 상태 형식 중 이 판이 쓸 수 있는 가장 새 것을 고르고, 지금 설정을 받아들이는지 봄.
+// 새 실행 파일에 -handover-formats 가 없으면 (0.2) -handover-check 의 "handover state 1" = 형식 1 만 읽음
+func checkNewBinary() (int, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), checkWait)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, exePath, "-handover-check").CombinedOutput()
-	want := fmt.Sprintf("handover state %d", stateVersion)
-	if err != nil || strings.TrimSpace(string(out)) != want {
-		return fmt.Errorf("%s -handover-check : %q %v (want %q : the new binary must support the same state format)",
-			exePath, strings.TrimSpace(string(out)), err, want)
+	var formats []int
+	out, err := exec.CommandContext(ctx, exePath, "-handover-formats").CombinedOutput()
+	if f, ok := strings.CutPrefix(strings.TrimSpace(string(out)), "handover formats "); err == nil && ok {
+		for _, s := range strings.Fields(f) {
+			if n, err := strconv.Atoi(s); err == nil {
+				formats = append(formats, n)
+			}
+		}
+	} else {
+		out, err = exec.CommandContext(ctx, exePath, "-handover-check").CombinedOutput()
+		if err == nil && strings.TrimSpace(string(out)) == "handover state 1" {
+			formats = []int{1}
+		}
+	}
+	format := 0
+	for _, n := range formats {
+		if n >= stateOldest && n <= stateVersion && n > format {
+			format = n
+		}
+	}
+	if format == 0 {
+		return 0, fmt.Errorf("%s : reads state formats %v, this binary writes %d to %d : restart instead (systemctl restart)",
+			exePath, formats, stateOldest, stateVersion)
 	}
 	out, err = exec.CommandContext(ctx, exePath, append(baseArgs(), "-t")...).CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("%s -t : %v : %s", exePath, err, strings.TrimSpace(string(out)))
+		return 0, fmt.Errorf("%s -t : %v : %s", exePath, err, strings.TrimSpace(string(out)))
 	}
-	return nil
+	return format, nil
 }
 
 // baseArgs : 이 프로세스의 명령줄 옵션에서 -resume 을 뺀 것 (판 올리기를 거듭해도 쌓이지 않게)
@@ -335,7 +358,7 @@ func (u *upgrader) handover() (err error) {
 	tFlush := time.Since(t0)
 	u.c.logStat(u.out) // 이 1 분의 통계 (새 판은 0 부터 셈)
 
-	hs := &handoverState{Version: stateVersion, Release: release, Rev: version(), PausedAt: t0, LockFd: -1, ListenFd: -1, HTTPFd: -1,
+	hs := &handoverState{Version: u.format, Release: release, Rev: version(), PausedAt: t0, LockFd: -1, ListenFd: -1, HTTPFd: -1,
 		Listen: *optListen, HTTP: *optHTTP}
 	dup := func(sc syscall.Conn) (int, error) {
 		fd, err := dupFd(sc)
@@ -493,11 +516,22 @@ type peerState struct {
 	SentCaps, RecvCaps   string
 	AddPathV4, AddPathV6 bool
 	FamV4, FamV6         bool
-	EorV4, EorV6         time.Time
+	Fams, AddPathFams    []family  // 0.3.0 (형식 1 에는 없음 : 0.2 에서 넘겨받으면 다음 Peer Up 까지 빈칸)
+	EorV4, EorV6         time.Time // 형식 1 : 보기 하나 (형식 2 는 Views, 이 칸은 주 보기 값을 함께 씀)
 	LastUpdate           time.Time
 	Adds, Dels           uint64
 	DownReason           string
 	Hist                 []eventState
+	Views                []viewState // 형식 2 (0.3.0) : 받은 보기마다
+}
+
+// viewState : 보기 하나의 수와 시각 (경로표는 state_rib.go)
+type viewState struct {
+	View         int
+	EorV4, EorV6 time.Time
+	LastUpdate   time.Time
+	Adds, Dels   uint64
+	GrewAt       uint32
 }
 
 type eventState struct {
@@ -521,24 +555,45 @@ func (s *routerState) load() *router {
 	return r
 }
 
-func savePeer(p *peer) peerState {
+// savePeer : peer 의 칸. format 2 면 보기마다 (Views), 1 이면 주 보기 하나를 옛 칸에 (0.2 로 되돌릴 때)
+func savePeer(p *peer, format int) peerState {
 	s := peerState{Key: p.key, IP: p.ip, IPStr: p.ipStr, RD: p.rd, Typ: p.typ, Flags: p.flags, AS: p.as, BgpID: p.bgpID, BgpIDRaw: p.bgpIDRaw,
 		BmpStats: p.bmpStats, BmpStatsAt: p.bmpStatsAt, Up: p.up, GotUp: p.gotUp, NoOpen: p.noOpen, Since: p.since,
 		LocalIP: p.localIP, LocalPort: p.localPort, RmtPort: p.rmtPort, HoldSent: p.holdSent, HoldRecv: p.holdRecv,
 		SentCaps: p.sentCaps, RecvCaps: p.recvCaps, AddPathV4: p.addPathV4, AddPathV6: p.addPathV6, FamV4: p.famV4, FamV6: p.famV6,
-		EorV4: p.eorV4, EorV6: p.eorV6, LastUpdate: p.lastUpdate, Adds: p.adds, Dels: p.dels, DownReason: p.downReason}
+		DownReason: p.downReason, Fams: p.fams, AddPathFams: p.addPathFams}
+	mv := p.view(-1)
+	s.EorV4, s.EorV6, s.LastUpdate, s.Adds, s.Dels = mv.eorV4, mv.eorV6, mv.lastUpdate, mv.adds, mv.dels
+	if format >= 2 {
+		for v, rv := range p.views {
+			if rv != nil {
+				s.Views = append(s.Views, viewState{View: v, EorV4: rv.eorV4, EorV6: rv.eorV6, LastUpdate: rv.lastUpdate,
+					Adds: rv.adds, Dels: rv.dels, GrewAt: rv.grewAt})
+			}
+		}
+	}
 	for _, e := range p.hist {
 		s.Hist = append(s.Hist, eventState{e.t, e.text})
 	}
 	return s
 }
 
-func (s *peerState) load() *peer {
+// load : 상태 파일 (format) 의 peer -> peer (경로표는 비어 있음 : loadRIBs)
+func (s *peerState) load(format int) *peer {
 	p := &peer{key: s.Key, ip: s.IP, ipStr: s.IPStr, rd: s.RD, typ: s.Typ, flags: s.Flags, as: s.AS, bgpID: s.BgpID, bgpIDRaw: s.BgpIDRaw,
 		bmpStats: s.BmpStats, bmpStatsAt: s.BmpStatsAt, up: s.Up, gotUp: s.GotUp, noOpen: s.NoOpen, since: s.Since,
 		localIP: s.LocalIP, localPort: s.LocalPort, rmtPort: s.RmtPort, holdSent: s.HoldSent, holdRecv: s.HoldRecv,
 		sentCaps: s.SentCaps, recvCaps: s.RecvCaps, addPathV4: s.AddPathV4, addPathV6: s.AddPathV6, famV4: s.FamV4, famV6: s.FamV6,
-		eorV4: s.EorV4, eorV6: s.EorV6, lastUpdate: s.LastUpdate, adds: s.Adds, dels: s.Dels, downReason: s.DownReason}
+		downReason: s.DownReason, fams: s.Fams, addPathFams: s.AddPathFams}
+	if format >= 2 {
+		for _, vs := range s.Views {
+			if vs.View >= 0 && vs.View < nViews {
+				p.views[vs.View] = &ribView{eorV4: vs.EorV4, eorV6: vs.EorV6, lastUpdate: vs.LastUpdate, adds: vs.Adds, dels: vs.Dels, grewAt: vs.GrewAt}
+			}
+		}
+	} else { // 형식 1 (0.2) : 보기 하나 = 마지막 per-peer 머리의 보기 (운영은 늘 In pre)
+		p.views[viewOf(s.Typ, s.Flags)] = &ribView{eorV4: s.EorV4, eorV6: s.EorV6, lastUpdate: s.LastUpdate, adds: s.Adds, dels: s.Dels}
+	}
 	for _, e := range s.Hist {
 		p.hist = append(p.hist, event{e.T, e.Text})
 	}
@@ -557,9 +612,25 @@ func writeHandover(path string, hs *handoverState, c *collector) (size int64, ro
 	for _, r := range rs {
 		s := saveRouter(r)
 		for _, p := range sortedPeers(r) {
-			s.Peers = append(s.Peers, savePeer(p))
+			if hs.Version < 2 && p.viewCount() > 1 {
+				return 0, 0, fmt.Errorf("peer %s of %s has %d views : state format %d holds one (the new binary is too old)", p.ipStr, r.ip, p.viewCount(), hs.Version)
+			}
+			if mv := p.view(-1); hs.Version < 2 && len(mv.fam) > 0 {
+				return 0, 0, fmt.Errorf("peer %s of %s has route tables of other address families : state format %d cannot hold them (the new binary is too old)", p.ipStr, r.ip, hs.Version)
+			}
+			if mv := p.view(-1); hs.Version < 2 && (mv.rib4.multi() || mv.rib6.multi()) {
+				return 0, 0, fmt.Errorf("peer %s of %s has Add-Path routes : state format %d cannot hold them (the new binary is too old)", p.ipStr, r.ip, hs.Version)
+			}
+			s.Peers = append(s.Peers, savePeer(p, hs.Version))
 			ps = append(ps, p)
-			routes += len(p.rib4) + len(p.rib6)
+			for _, rv := range p.views {
+				if rv != nil {
+					routes += rv.rib4.paths() + rv.rib6.paths()
+					for _, t := range rv.fam {
+						routes += t.paths()
+					}
+				}
+			}
 		}
 		hs.Routers = append(hs.Routers, s)
 	}
@@ -579,7 +650,7 @@ func writeHandover(path string, hs *handoverState, c *collector) (size int64, ro
 	binary.LittleEndian.PutUint64(n[:], uint64(g.Len()))
 	w.Write(n[:])
 	w.Write(g.Bytes())
-	ribSize, err := writeRIBs(w, ps)
+	ribSize, err := writeRIBs(w, ps, hs.Version)
 	if err == nil {
 		err = w.Flush()
 	}
@@ -591,9 +662,19 @@ func writeHandover(path string, hs *handoverState, c *collector) (size int64, ro
 
 // ---- 새 판 ----
 
-// handoverCheck : -handover-check (옛 판이 exec 전에 부름) : 아는 상태 형식 판
+// handoverCheck : -handover-check = 0.2 가 exec 전에 부름 : 글자가 꼭 "handover state 1" 이어야 함 (0.2 는 같은 글자만 받음).
+// 이 판은 형식 1 을 읽으므로 그대로 둠. 0.3 부터는 -handover-formats 로 묻고 답함
 func handoverCheck() {
-	fmt.Printf("handover state %d\n", stateVersion)
+	fmt.Println("handover state 1")
+}
+
+// handoverFormats : -handover-formats (0.3.0) : 읽는 상태 형식들. 넘겨주는 판이 이 중 하나를 골라 씀
+func handoverFormats() {
+	fmt.Print("handover formats")
+	for n := stateOldest; n <= stateVersion; n++ {
+		fmt.Printf(" %d", n)
+	}
+	fmt.Println()
 }
 
 // readHandover : -resume 의 상태 파일에서 gob 부분까지 읽음 (경로표는 loadRIBs 가 이어서)
@@ -623,9 +704,9 @@ func readHandover(path string) (*handoverState, error) {
 		f.Close()
 		return nil, fmt.Errorf("%s : %w", path, err)
 	}
-	if hs.Version != stateVersion {
+	if hs.Version < stateOldest || hs.Version > stateVersion {
 		f.Close()
-		return nil, fmt.Errorf("%s : state version %d, this binary knows %d", path, hs.Version, stateVersion)
+		return nil, fmt.Errorf("%s : state version %d, this binary reads %d to %d", path, hs.Version, stateOldest, stateVersion)
 	}
 	hs.f, hs.rd = f, rd
 	return hs, nil
@@ -640,7 +721,7 @@ func (hs *handoverState) restore(c *collector) {
 		s := &hs.Routers[i]
 		r := s.load()
 		for j := range s.Peers {
-			p := s.Peers[j].load()
+			p := s.Peers[j].load(hs.Version)
 			p.ribWait = !c.noRIB
 			r.peers[p.key] = p
 			hs.peers = append(hs.peers, p)
@@ -743,14 +824,14 @@ func (hs *handoverState) loadRIBs(c *collector) {
 	}
 	var routes atomic.Int64
 	err := readRIBs(hs.rd, len(hs.peers), func(i int, b []byte) error {
-		tmp := &peer{}
-		if err := tmp.decodeRIB(b); err != nil {
+		r, p := hs.owner[i], hs.peers[i]
+		tabs, n, err := decodeRIB(b, hs.Version, viewOf(p.typ, p.flags)) // p.typ / flags 는 restore 뒤 바뀌지 않음 (잠금 없이 읽음)
+		if err != nil {
 			return err
 		}
-		r, p := hs.owner[i], hs.peers[i]
 		r.mu.Lock()
-		if p.ribLoaded(tmp.rib4, tmp.rib6) {
-			routes.Add(int64(len(tmp.rib4) + len(tmp.rib6)))
+		if p.ribLoaded(tabs, c.on) {
+			routes.Add(int64(n))
 		}
 		r.mu.Unlock()
 		return nil
@@ -760,7 +841,7 @@ func (hs *handoverState) loadRIBs(c *collector) {
 		for i, p := range hs.peers {
 			r := hs.owner[i]
 			r.mu.Lock()
-			if p.ribLoaded(nil, nil) {
+			if p.ribLoaded([nViews]*ribView{}, c.on) {
 				left++
 			}
 			r.mu.Unlock()

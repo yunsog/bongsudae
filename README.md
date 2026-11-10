@@ -11,9 +11,9 @@ publishes them to Kafka in the OpenBMP v1.7 message format (or JSON) and answers
 questions about them over an HTTP API.
 
 It is a single binary meant as a drop-in replacement for the OpenBMP
-collector (`openbmpd`) for consumers that read the `openbmp.parsed.*` topics,
-without copying openbmpd's bugs : where openbmpd's output disagrees with the
-RFCs, Bongsudae follows the RFC and documents the difference
+collector (`openbmpd`) for consumers that read the `openbmp.parsed.*` topics.
+Where openbmpd's output disagrees with the RFCs, Bongsudae follows the RFC
+and documents the difference
 ([docs/kafka.md](docs/kafka.md)).
 
 Bongsudae runs in production with a few dozen routers and about 1,300 peers
@@ -24,11 +24,14 @@ in each release.
 ## Features
 
 - **BMP v3** : Initiation, Termination, Peer Up / Down, Route Monitoring
-  (pre-policy Adj-RIB-In), Statistics Reports (shown per peer). 4-octet AS,
+  (all views), Statistics Reports (shown per peer). 4-octet AS,
   Add-Path, MP_REACH / MP_UNREACH (IPv4 routes in MP_REACH too), AS4_PATH,
   AS4_AGGREGATOR, End-of-RIB.
-- **Scope** : IPv4 / IPv6 unicast. Other address families (VPN, EVPN, BGP-LS ...)
-  are counted and dropped.
+- **Address families** : IPv4 / IPv6 unicast, labeled unicast, multicast,
+  VPNv4 / VPNv6, EVPN and FlowSpec, each in its own Kafka topic. Other families
+  (BGP-LS, MVPN ...) are counted and dropped.
+- **Views** : Adj-RIB-In pre / post policy, Adj-RIB-Out (RFC 8671) and Loc-RIB
+  (RFC 9069), each with its own route table; Add-Path (one route per path ID).
 - **Kafka output** : OpenBMP v1.7 `unicast_prefix`, `peer`, `router` messages
   (same headers, field order and hashes as openbmpd), or the same data as JSON
   lines (`kafka.format = json`), plus `bmp_raw` = every received BMP message
@@ -45,7 +48,8 @@ in each release.
 - **Hitless upgrade** : `bongsudae -upgrade` hands the router sessions and the
   route tables to the new binary (same pid). Routers do not reconnect and do not
   resend their tables; if anything fails the old process keeps running.
-- **Robust input** : allow list, first message must be Initiation within 30 s,
+- **Robust input** : allow list, first message must be Initiation within 10 s,
+  limited connections waiting for Initiation (per address and in total),
   1 MB message limit, a bad message affects only itself (never the session or
   the process), one goroutine per router, a new session from a router replaces
   the old one. Port scanners and broken BMP do not stop the collector.
@@ -54,13 +58,29 @@ in each release.
   (`-input file`), so two releases can be compared on the same input.
 - **Operations** : configuration file with `systemctl reload`, systemd watchdog,
   one stat line per minute, recovers from Kafka restarts and re-created topics,
-  route tables can be turned off (`bmp.rib = false`) to save memory.
+  route tables per family can be turned on or off (`bmp.rib`) to save memory.
 - **Dependencies** : Go standard library and [franz-go](https://github.com/twmb/franz-go)
   (Kafka client).
 
 ## Install
 
-Go 1.26 or later. Linux (the hitless upgrade and systemd integration are Linux only).
+Linux (the hitless upgrade and systemd integration are Linux only).
+
+**Binary** (0.3.0+) : download `bongsudae_<version>_linux_amd64.tar.gz` or
+`..._linux_arm64.tar.gz` from [Releases](https://github.com/yunsog/bongsudae/releases).
+Static binaries (no C library), so they run on any Linux distribution.
+The arm64 binary is not yet tested on real hardware.
+
+```
+tar xzf bongsudae_0.3.0_linux_amd64.tar.gz
+sha256sum -c --ignore-missing SHA256SUMS          # SHA256SUMS from the same release
+sudo install -m 755 bongsudae_0.3.0_linux_amd64/bongsudae /usr/local/bin/bongsudae
+```
+
+The archive also has README, CHANGELOG, LICENSE and the example configuration
+and systemd unit.
+
+**From source** : Go 1.26 or later.
 
 ```
 go install github.com/yunsog/bongsudae@latest     # binary in $(go env GOPATH)/bin/bongsudae
@@ -104,7 +124,7 @@ without a resend : build it at the same path, then `./bongsudae -upgrade`.
 - [User manual](docs/manual.md) : install, options, configuration, operation, upgrade, troubleshooting
 - [HTTP API](docs/api.md) (also served by the collector at `/api/doc`), including `/metrics`
 - [Kafka messages](docs/kafka.md) : topics, fields, JSON format, hashes, differences from openbmpd
-- Introduction slides : [English](docs/bongsudae_v0.2_en.pdf), [Korean](docs/bongsudae_v0.2_ko.pdf)
+- Introduction slides : [English](docs/bongsudae_v0.3_en.pdf), [Korean](docs/bongsudae_v0.3_ko.pdf)
 
 Source code comments are in Korean; command line help, log messages and API errors are in English.
 

@@ -11,6 +11,7 @@ package main
 
 import (
 	"crypto/md5"
+	"encoding/binary"
 	"encoding/hex"
 	"strconv"
 	"strings"
@@ -86,6 +87,14 @@ type rowEnc struct {
 	segC   []byte
 	ready  [2]bool
 	hashIn []byte // 줄 해시 입력 (다시 씀)
+
+	// 경로 종류 (0.3.0) : unicast 밖 종류는 줄마다 다른 칸이 더 있음 (famroute.go). ext = false 면 unicast 그대로 (segC)
+	ext      bool
+	vpn      bool    // l3vpn 줄 (34 칸 : 31 칸 뒤에 RD, RD 종류, large community)
+	labels   []byte  // 이 줄의 라벨 글자 "16001,16002" (labeled unicast / L3VPN)
+	rd       [8]byte // 이 줄의 RD (vpn)
+	tailPre  []byte  // ext : isPrePolicy / isAdjRibIn 글자 (TSV "\t1\t1", JSON ,"is_pre_policy":..)
+	tailLast []byte  // ext : 마지막 large community 와 줄 끝
 }
 
 func afiIdx(v4 bool) int {
@@ -108,6 +117,7 @@ func (e *rowEnc) reset(del, json bool, rp *rowPeer, a *attrs) {
 	e.del, e.json, e.rp, e.a = del, json, rp, a
 	e.ready = [2]bool{}
 	e.segC = e.segC[:0]
+	e.ext, e.vpn = false, false
 }
 
 // prepare : afi 의 같은 부분을 만듦 (UPDATE 마다 afi 마다 한 번)
@@ -144,6 +154,8 @@ func (e *rowEnc) prepare(v4 bool) {
 			large = e.a.largeComm
 		}
 		e.segC = append(joinTab(e.segC, true, "", b01(rp.prePolicy), b01(rp.adjRibIn), large), '\n') // 28 labels 빈칸
+		e.tailPre = joinTab(e.tailPre[:0], true, b01(rp.prePolicy), b01(rp.adjRibIn))
+		e.tailLast = append(joinTab(e.tailLast[:0], true, large), '\n')
 	}
 }
 
@@ -182,14 +194,38 @@ func (e *rowEnc) row(b []byte, seq uint64, p prefix, v4 bool) []byte {
 	b = append(b, '\t')
 	b = append(b, e.segB[i]...)
 	b = strconv.AppendUint(b, uint64(p.pathID), 10)
-	return append(b, e.segC...)
+	if !e.ext {
+		return append(b, e.segC...)
+	}
+	// 경로 종류 : 28 labels, 29 isPrePolicy, 30 isAdjRibIn, (l3vpn) 31 RD, 32 RD 종류, 마지막 large community
+	b = append(b, '\t')
+	b = append(b, e.labels...)
+	b = append(b, e.tailPre...)
+	if e.vpn {
+		b = append(b, '\t')
+		b = append(b, rdString(e.rd)...)
+		b = append(b, '\t')
+		b = strconv.AppendUint(b, uint64(be16(e.rd[:2])), 10)
+	}
+	return append(b, e.tailLast...)
 }
 
 // rowHash : 줄 해시 = md5(프리픽스 글자 + 길이 1 바이트 + peer hash), 글자 32 (할당 없이)
 func (e *rowEnc) rowHash(p prefix) (h [32]byte) {
 	in := p.addr.AppendTo(e.hashIn[:0])
 	in = append(in, byte(p.length))
+	if e.vpn { // openbmp 스키마 : l3vpn 은 RD 를 넣음
+		in = append(in, e.rd[:]...)
+	}
 	in = append(in, e.rp.peerHash...)
+	if e.ext { // 경로 종류 : path ID (0 이 아니면), 라벨이 있으면 1 (openbmp 스키마. unicast 줄은 전과 같게 둠)
+		if p.pathID != 0 {
+			in = binary.BigEndian.AppendUint32(in, p.pathID)
+		}
+		if len(e.labels) > 0 {
+			in = append(in, '1')
+		}
+	}
 	e.hashIn = in
 	sum := md5.Sum(in)
 	hex.Encode(h[:], sum[:])
@@ -234,14 +270,19 @@ func (s *rowSink) add(e *rowEnc, seq uint64, p prefix, v4 bool) {
 	s.buf[b] = e.row(s.buf[b], seq, p, v4)
 }
 
-// msgs : 모은 줄을 메시지로 만들어 out 뒤에 붙임
+// msgs : 모은 줄을 unicast_prefix 메시지로 만들어 out 뒤에 붙임
 func (s *rowSink) msgs(out []outMsg, c *collector, peerHash string, topics []string) []outMsg {
+	return s.msgsKind(out, c, kindPrefix, peerHash, topics)
+}
+
+// msgsKind : 모은 줄을 종류 kind 의 메시지로 (경로 종류 토픽은 topics = nil : 고정 토픽, famroute.go)
+func (s *rowSink) msgsKind(out []outMsg, c *collector, kind, peerHash string, topics []string) []outMsg {
 	for _, b := range s.order {
 		key := peerHash
 		if s.n > 0 {
 			key = peerHash + "." + strconv.Itoa(b)
 		}
-		m := c.makeMsg(kindPrefix, key, s.buf[b], s.rows[b])
+		m := c.makeMsg(kind, key, s.buf[b], s.rows[b])
 		m.topics = topics
 		out = append(out, m)
 	}

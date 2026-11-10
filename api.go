@@ -46,7 +46,16 @@ var apiDoc []byte
 
 const (
 	silentWarn = 10 * time.Minute // up 인데 이만큼 메시지가 없으면 경고
-	apiConc    = 4                // 동시에 처리하는 API 요청 수
+	// (11-05) API 자리와 시간 : 느린 / 많은 요청이 API 전체나 메모리를 막지 못하게
+	apiConc     = 4                // 동시에 처리하는 무거운 요청 (경로 목록 /prefixes, 찾기 /prefix)
+	apiLight    = 16               // 그 밖 (현황, 통계, /metrics, 규칙, reset) : 무거운 요청이 몰려도 늘 됨
+	apiReadWait = 30 * time.Second // 요청 머리 + 본문을 다 받는 시간
+)
+
+// 시험이 짧게 바꾸므로 변수
+var (
+	apiWait      = 5 * time.Second // 자리를 이만큼 못 얻으면 503
+	apiWriteWait = time.Minute     // 응답을 쓸 때 상대가 이만큼 받아 가지 않으면 끊음 (쓸 때마다 연장 = 긴 내려받기는 계속)
 )
 
 // startAPI : 웹 API 를 goroutine 으로 시작
@@ -70,6 +79,54 @@ func parseHTTPAllow(s string) ([]netip.Prefix, error) {
 	}
 	return parseAllow(s)
 }
+
+// isHeavy : 경로표를 훑는 요청인가 (/prefix 찾기, /prefixes 목록) = 무거운 자리를 씀
+func isHeavy(path string) bool {
+	return strings.HasSuffix(path, "/prefix") || strings.HasSuffix(path, "/prefixes")
+}
+
+// takeSlot : 자리 하나를 얻음. apiWait 안에 못 얻으면 503 을 쓰고 false, 상대가 끊어도 false.
+// (11-05 전에는 끝없이 기다려, 느린 연결 4 개가 API 전체를 막았음)
+func takeSlot(sem chan struct{}, w http.ResponseWriter, r *http.Request) bool {
+	select {
+	case sem <- struct{}{}:
+		return true
+	default:
+	}
+	t := time.NewTimer(apiWait)
+	defer t.Stop()
+	select {
+	case sem <- struct{}{}:
+		return true
+	case <-r.Context().Done():
+		return false
+	case <-t.C:
+		w.Header().Set("Retry-After", "5")
+		http.Error(w, "busy: too many API requests, try again later", http.StatusServiceUnavailable)
+		return false
+	}
+}
+
+// slowGuard : 응답을 쓸 때마다 쓰기 기한을 apiWriteWait 뒤로 미룸.
+// 받아 가지 않는 상대만 끊기고 (자리가 풀림), 계속 받아 가는 긴 내려받기는 끝까지 감
+type slowGuard struct {
+	http.ResponseWriter
+	rc *http.ResponseController
+}
+
+func newSlowGuard(w http.ResponseWriter) slowGuard {
+	g := slowGuard{w, http.NewResponseController(w)}
+	g.rc.SetWriteDeadline(time.Time{}) // 같은 연결의 앞 요청이 남긴 기한을 지움 (긴 처리 뒤 첫 쓰기가 실패하지 않게)
+	return g
+}
+
+func (g slowGuard) Write(b []byte) (int, error) {
+	g.rc.SetWriteDeadline(time.Now().Add(apiWriteWait))
+	return g.ResponseWriter.Write(b)
+}
+
+// Unwrap : http.ResponseController 가 원래 ResponseWriter 를 찾게
+func (g slowGuard) Unwrap() http.ResponseWriter { return g.ResponseWriter }
 
 // ln 이 있으면 (판 올리기로 이어 받은 소켓) 그것을 씀
 func startAPI(addr string, c *collector, ln net.Listener) error {
@@ -103,17 +160,25 @@ func startAPI(addr string, c *collector, ln net.Listener) error {
 	upg.mu.Lock()
 	upg.httpLn = ln // 판 올리기가 새 판에 넘김
 	upg.mu.Unlock()
-	sem := make(chan struct{}, apiConc)
+	heavy, light := make(chan struct{}, apiConc), make(chan struct{}, apiLight)
 	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !httpAllowed(r.RemoteAddr) {
 			http.Error(w, "not allowed (http.allow)", http.StatusForbidden)
 			return
 		}
-		sem <- struct{}{}
+		w = newSlowGuard(w)
+		sem := light
+		if isHeavy(r.URL.Path) {
+			sem = heavy
+		}
+		if !takeSlot(sem, w, r) {
+			return
+		}
 		defer func() { <-sem }()
 		mux.ServeHTTP(w, r)
 	})
-	srv := &http.Server{Handler: h, ReadHeaderTimeout: 10 * time.Second, IdleTimeout: time.Minute}
+	// ReadTimeout : 본문을 천천히 보내는 상대 (slowloris) 를 끊음. 본문을 다 읽으면 net/http 가 읽기 기한을 풂 (긴 처리는 괜찮음)
+	srv := &http.Server{Handler: h, ReadHeaderTimeout: 10 * time.Second, ReadTimeout: apiReadWait, IdleTimeout: time.Minute}
 	log.Printf("http api %s", addr)
 	go func() { log.Printf("http api: %v", srv.Serve(ln)) }()
 	return nil
@@ -149,29 +214,34 @@ type routerJSON struct {
 }
 
 type peerJSON struct {
-	Router     string   `json:"router"`
-	RouterName string   `json:"router_name"`
-	Peer       string   `json:"peer"`
-	RD         string   `json:"rd"`
-	AS         uint32   `json:"as"`
-	BGPID      string   `json:"bgp_id"`
-	Type       string   `json:"type"`
-	State      string   `json:"state"`
-	Since      string   `json:"since"`
-	PeerUp     bool     `json:"peer_up"` // 이번 세션의 Peer Up 을 받음 (경로 수가 정확)
-	Synced     bool     `json:"synced"`  // 처음 전체 전송을 다 받음 (협상된 종류마다 End-of-RIB)
-	Settled    bool     `json:"settled"` // synced 이거나, Peer Up 뒤 5 분 지났고 5 분 동안 새 프리픽스 없음 (0.2.0, EoR 을 안 넘기는 라우터용)
-	EoRV4      string   `json:"eor_v4,omitempty"`
-	EoRV6      string   `json:"eor_v6,omitempty"`
-	RoutesV4   int      `json:"routes_v4"`
-	RoutesV6   int      `json:"routes_v6"`
-	LastUpdate string   `json:"last_update,omitempty"`
-	Adds       uint64   `json:"adds"`
-	Dels       uint64   `json:"dels"`
-	DownReason string   `json:"down_reason,omitempty"`
-	Kafka      []string `json:"kafka"`      // 이 peer 의 unicast_prefix 토픽 ([] = 안 보냄)
-	KafkaFrom  string   `json:"kafka_from"` // peer | router | default
-	Warn       []string `json:"warn,omitempty"`
+	Router     string         `json:"router"`
+	RouterName string         `json:"router_name"`
+	Peer       string         `json:"peer"`
+	RD         string         `json:"rd"`
+	AS         uint32         `json:"as"`
+	BGPID      string         `json:"bgp_id"`
+	Type       string         `json:"type"`
+	State      string         `json:"state"`
+	Since      string         `json:"since"`
+	PeerUp     bool           `json:"peer_up"` // 이번 세션의 Peer Up 을 받음 (경로 수가 정확)
+	Synced     bool           `json:"synced"`  // 처음 전체 전송을 다 받음 (협상된 종류마다 End-of-RIB)
+	Settled    bool           `json:"settled"` // synced 이거나, Peer Up 뒤 5 분 지났고 5 분 동안 새 프리픽스 없음 (0.2.0, EoR 을 안 넘기는 라우터용)
+	EoRV4      string         `json:"eor_v4,omitempty"`
+	EoRV6      string         `json:"eor_v6,omitempty"`
+	RoutesV4   int            `json:"routes_v4"`
+	RoutesV6   int            `json:"routes_v6"`
+	PathsV4    int            `json:"paths_v4,omitempty"` // Add-Path 세션만 (0.3.0) : 경로 수 (routes_v4 = 프리픽스 수)
+	PathsV6    int            `json:"paths_v6,omitempty"`
+	FamRoutes  map[string]int `json:"family_routes,omitempty"` // 0.3.0 : 경로표를 든 다른 종류마다 경로 수 (bmp.rib 에 vpnv4 등)
+	LastUpdate string         `json:"last_update,omitempty"`
+	Adds       uint64         `json:"adds"`
+	Dels       uint64         `json:"dels"`
+	View       string         `json:"view"`            // 위 경로 수 / synced / EoR ... 의 보기 (0.3.0, 주 보기 = 받은 보기 중 첫째, 보통 in-pre)
+	Views      []viewJSON     `json:"views,omitempty"` // 보기가 둘 이상일 때 보기마다 (0.3.0)
+	DownReason string         `json:"down_reason,omitempty"`
+	Kafka      []string       `json:"kafka"`      // 이 peer 의 unicast_prefix 토픽 ([] = 안 보냄)
+	KafkaFrom  string         `json:"kafka_from"` // peer | router | default
+	Warn       []string       `json:"warn,omitempty"`
 	// 상세 (/api/routers/{ip}/peers/{peer}) 만
 	Detail *peerDetail `json:"detail,omitempty"`
 }
@@ -187,6 +257,8 @@ type peerDetail struct {
 	HoldRecv   uint16   `json:"hold_recv"`
 	SentCaps   string   `json:"sent_caps"`
 	RecvCaps   string   `json:"recv_caps"`
+	Families   []string `json:"families,omitempty"` // 0.3.0 : 두 OPEN 이 함께 알린 경로 종류 (ipv4-unicast, vpnv4 ...). 해석하는 것은 ipv4 / ipv6-unicast 뿐 (나머지는 세고 버림)
+	AddPath    []string `json:"add_path,omitempty"` // 0.3.0 : 그중 Add-Path 로 받는 종류
 	History    []string `json:"history"`
 	// BMP Stats Report (0.2.0) : 라우터가 보낸 마지막 값 (없으면 빠짐). 이름 = IANA 종류, 주소 종류마다는 _<afi>_<safi>
 	BMPStats   map[string]uint64 `json:"bmp_stats,omitempty"`
@@ -194,25 +266,29 @@ type peerDetail struct {
 }
 
 type routeJSON struct {
-	Router       string `json:"router"`
-	RouterName   string `json:"router_name"`
-	Peer         string `json:"peer"`
-	PeerAS       uint32 `json:"peer_as"`
-	Prefix       string `json:"prefix"`
-	ASPath       string `json:"as_path"`
-	OriginAS     uint32 `json:"origin_as"`
-	OriginSet    string `json:"origin_as_set,omitempty"` // 경로가 AS_SET 으로 끝나면 "{a,b}" (origin_as 는 0)
-	NextHop      string `json:"nexthop"`
-	Origin       string `json:"origin"`
-	MED          uint32 `json:"med"`
-	LocalPref    uint32 `json:"local_pref"`
-	Communities  string `json:"communities,omitempty"`
-	ExtComm      string `json:"ext_communities,omitempty"`
-	LargeComm    string `json:"large_communities,omitempty"`
-	ClusterList  string `json:"cluster_list,omitempty"`
-	OriginatorID string `json:"originator_id,omitempty"`
-	Aggregator   string `json:"aggregator,omitempty"`
-	Since        string `json:"since"`
+	Router       string  `json:"router"`
+	RouterName   string  `json:"router_name"`
+	Peer         string  `json:"peer"`
+	PeerAS       uint32  `json:"peer_as"`
+	Prefix       string  `json:"prefix"`
+	PathID       *uint32 `json:"path_id,omitempty"` // Add-Path 세션의 경로만 (0.3.0, RFC 7911 : 같은 프리픽스에 경로 여럿)
+	RD           string  `json:"rd,omitempty"`      // L3VPN (family=vpnv4 / vpnv6) 만 (0.3.0)
+	Labels       string  `json:"labels,omitempty"`  // labeled unicast / L3VPN 만 (0.3.0)
+	Rule         string  `json:"rule,omitempty"`    // FlowSpec 만 (0.3.0) : 규칙 글자 (kafka.md 3-4)
+	ASPath       string  `json:"as_path"`
+	OriginAS     uint32  `json:"origin_as"`
+	OriginSet    string  `json:"origin_as_set,omitempty"` // 경로가 AS_SET 으로 끝나면 "{a,b}" (origin_as 는 0)
+	NextHop      string  `json:"nexthop"`
+	Origin       string  `json:"origin"`
+	MED          uint32  `json:"med"`
+	LocalPref    uint32  `json:"local_pref"`
+	Communities  string  `json:"communities,omitempty"`
+	ExtComm      string  `json:"ext_communities,omitempty"`
+	LargeComm    string  `json:"large_communities,omitempty"`
+	ClusterList  string  `json:"cluster_list,omitempty"`
+	OriginatorID string  `json:"originator_id,omitempty"`
+	Aggregator   string  `json:"aggregator,omitempty"`
+	Since        string  `json:"since"`
 }
 
 // ---- 글자 ----
@@ -300,11 +376,46 @@ func (c *collector) routerView(r *router, now time.Time) routerJSON {
 	return j
 }
 
+// viewJSON : 보기 하나 (peer 의 views)
+type viewJSON struct {
+	View       string         `json:"view"` // in-pre | in-post | out-pre | out-post | loc-rib
+	RoutesV4   int            `json:"routes_v4"`
+	RoutesV6   int            `json:"routes_v6"`
+	PathsV4    int            `json:"paths_v4,omitempty"`
+	PathsV6    int            `json:"paths_v6,omitempty"`
+	FamRoutes  map[string]int `json:"family_routes,omitempty"`
+	Synced     bool           `json:"synced"`
+	Settled    bool           `json:"settled"`
+	EoRV4      string         `json:"eor_v4,omitempty"`
+	EoRV6      string         `json:"eor_v6,omitempty"`
+	LastUpdate string         `json:"last_update,omitempty"`
+	Adds       uint64         `json:"adds"`
+	Dels       uint64         `json:"dels"`
+}
+
 func (c *collector) peerView(r *router, p *peer, detail bool) peerJSON {
+	now := time.Now()
+	mv := p.mainView()
+	rv := p.view(mv)
 	j := peerJSON{Router: r.ip, RouterName: r.sysName, Peer: p.ip.String(), RD: p.rd, AS: p.as, BGPID: p.bgpID,
 		Type: peerTypeName(p.typ), State: stateName(p.up), Since: tstr(p.since), PeerUp: p.gotUp,
-		RoutesV4: len(p.rib4), RoutesV6: len(p.rib6), LastUpdate: tstr(p.lastUpdate), Adds: p.adds, Dels: p.dels,
-		DownReason: p.downReason, Synced: p.synced(), Settled: p.settled(time.Now()), EoRV4: tstr(p.eorV4), EoRV6: tstr(p.eorV6)}
+		RoutesV4: rv.rib4.size(), RoutesV6: rv.rib6.size(), LastUpdate: tstr(rv.lastUpdate), Adds: rv.adds, Dels: rv.dels,
+		DownReason: p.downReason, Synced: p.syncedIn(rv), Settled: p.settledIn(rv, now), EoRV4: tstr(rv.eorV4), EoRV6: tstr(rv.eorV6),
+		View: viewNames[mv]}
+	j.PathsV4, j.PathsV6 = p.addPathCounts(rv)
+	j.FamRoutes = rv.famCounts()
+	if p.viewCount() > 1 {
+		for v, x := range p.views {
+			if x != nil {
+				vj := viewJSON{View: viewNames[v], RoutesV4: x.rib4.size(), RoutesV6: x.rib6.size(),
+					Synced: p.syncedIn(x), Settled: p.settledIn(x, now), EoRV4: tstr(x.eorV4), EoRV6: tstr(x.eorV6),
+					LastUpdate: tstr(x.lastUpdate), Adds: x.adds, Dels: x.dels}
+				vj.PathsV4, vj.PathsV6 = p.addPathCounts(x)
+				vj.FamRoutes = x.famCounts()
+				j.Views = append(j.Views, vj)
+			}
+		}
+	}
 	j.Kafka, j.KafkaFrom = c.rules.effective(r.ip, p.ip.Unmap().String())
 	if !p.up {
 		j.Warn = append(j.Warn, "down")
@@ -315,12 +426,15 @@ func (c *collector) peerView(r *router, p *peer, detail bool) peerJSON {
 		j.Warn = append(j.Warn, "Peer Up without OPEN")
 	}
 	if c.noRIB {
-		j.Warn = append(j.Warn, "route table off (-rib=false)")
+		j.Warn = append(j.Warn, "route table off (-rib=none)")
+	} else if off := c.ribOff(p.fams); len(off) > 0 {
+		j.Warn = append(j.Warn, "route table off for "+strings.Join(off, ", ")+" (-rib)")
 	}
 	if detail {
 		d := &peerDetail{PrePolicy: p.flags&flagL == 0, AdjRibIn: p.flags&flagO == 0 && p.typ != peerTypeLocRIB,
 			AS4: p.flags&flagA == 0, LocalIP: p.localIP, LocalPort: p.localPort, RemotePort: p.rmtPort,
-			HoldSent: p.holdSent, HoldRecv: p.holdRecv, SentCaps: p.sentCaps, RecvCaps: p.recvCaps}
+			HoldSent: p.holdSent, HoldRecv: p.holdRecv, SentCaps: p.sentCaps, RecvCaps: p.recvCaps,
+			Families: familyList(p.fams), AddPath: familyList(p.addPathFams)}
 		for _, e := range p.hist {
 			d.History = append(d.History, tstr(e.t)+" "+e.text)
 		}
@@ -488,32 +602,67 @@ type ribRow struct {
 	peerAS                   uint32
 	pfx                      netip.Prefix
 	rt                       route
+	pathID                   uint32 // Add-Path 의 path ID (addPath 일 때만 뜻이 있음)
+	addPath                  bool
+	rd                       string // L3VPN 경로의 RD 글자 (0.3.0, 그 밖은 빈칸)
+	rule                     bool   // FlowSpec 규칙 (속성 labels 칸 = 규칙 글자, 0.3.0)
 }
+
+// setPath : 경로표에서 꺼낸 경로 하나를 줄에
+func (x *ribRow) setPath(p pathOf) { x.rt, x.pathID, x.addPath = p.rt, p.id, p.addPath }
 
 func (x *ribRow) json() routeJSON {
 	a := x.rt.a.Value()
-	return routeJSON{Router: x.router, RouterName: x.routerName, Peer: x.peer, PeerAS: x.peerAS, Prefix: x.pfx.String(),
+	var id *uint32
+	if x.addPath {
+		id = &x.pathID
+	}
+	labels, rule := a.labels, ""
+	if x.rule {
+		labels, rule = "", a.labels
+	}
+	pfx := ""
+	if x.pfx.IsValid() { // FlowSpec 규칙에 목적지가 없으면 빈칸
+		pfx = x.pfx.String()
+	}
+	return routeJSON{Router: x.router, RouterName: x.routerName, Peer: x.peer, PeerAS: x.peerAS, Prefix: pfx, PathID: id,
+		RD: x.rd, Labels: labels, Rule: rule,
 		ASPath: a.asPath, OriginAS: a.originAS, OriginSet: a.originSet, NextHop: a.nextHop, Origin: a.origin, MED: a.med, LocalPref: a.localPref,
 		Communities: a.community, ExtComm: a.extComm, LargeComm: a.largeComm, ClusterList: a.clusterList,
 		OriginatorID: a.originatorID, Aggregator: a.aggregator, Since: tstr(time.Unix(int64(x.rt.t), 0))}
 }
 
-var textHead = "router\trouter_name\tpeer\tpeer_as\tprefix\tas_path\torigin_as\tnexthop\torigin\tmed\tlocal_pref\tcommunities\text_communities\tlarge_communities\tsince\n"
+var textHead = "router\trouter_name\tpeer\tpeer_as\tprefix\tas_path\torigin_as\tnexthop\torigin\tmed\tlocal_pref\tcommunities\text_communities\tlarge_communities\tsince"
 
-func (x *ribRow) text() string {
+// textFamHead : family= (unicast 밖 종류) 줄일 때 끝에 붙는 열 (0.3.0, 열 이름으로 읽는 소비자는 그대로)
+const textFamHead = "\trd\tlabels\trule"
+
+// text : 탭 구분 한 줄. fam 이면 끝에 rd / labels / rule
+func (x *ribRow) text(fam bool) string {
 	j := x.json()
 	origin := u32(j.OriginAS)
 	if j.OriginSet != "" {
 		origin = j.OriginSet
 	}
-	return strings.Join([]string{j.Router, j.RouterName, j.Peer, u32(j.PeerAS), j.Prefix, j.ASPath, origin,
-		j.NextHop, j.Origin, u32(j.MED), u32(j.LocalPref), j.Communities, j.ExtComm, j.LargeComm, j.Since}, "\t") + "\n"
+	cols := []string{j.Router, j.RouterName, j.Peer, u32(j.PeerAS), j.Prefix, j.ASPath, origin,
+		j.NextHop, j.Origin, u32(j.MED), u32(j.LocalPref), j.Communities, j.ExtComm, j.LargeComm, j.Since}
+	if fam {
+		cols = append(cols, j.RD, j.Labels, j.Rule)
+	}
+	return strings.Join(cols, "\t") + "\n"
+}
+
+// famText : 질의의 family= 가 unicast 밖 종류인가 (글자 응답에 rd / labels / rule 열을 붙임)
+func famText(req *http.Request) bool {
+	f, err := parseFamily(req.URL.Query().Get("family"))
+	return err == nil && f.safi() != safiUnicast
 }
 
 // rowWriter : JSON 배열 또는 탭 글자를 한 줄씩 내보냄 (큰 목록을 메모리에 다 만들지 않음)
 type rowWriter struct {
 	w     *bufio.Writer
 	text  bool
+	fam   bool // 글자 응답에 rd / labels / rule 열 (family=, 0.3.0)
 	n     int
 	limit int
 }
@@ -523,7 +672,12 @@ func newRowWriter(w http.ResponseWriter, req *http.Request) *rowWriter {
 	rw.limit, _ = strconv.Atoi(req.URL.Query().Get("limit"))
 	if rw.text {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		rw.fam = famText(req)
 		rw.w.WriteString(textHead)
+		if rw.fam {
+			rw.w.WriteString(textFamHead)
+		}
+		rw.w.WriteString("\n")
 	} else {
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		rw.w.WriteString("[")
@@ -539,7 +693,7 @@ func (rw *rowWriter) row(x *ribRow) {
 		return
 	}
 	if rw.text {
-		rw.w.WriteString(x.text())
+		rw.w.WriteString(x.text(rw.fam))
 	} else {
 		if rw.n > 0 {
 			rw.w.WriteString(",")
@@ -558,21 +712,24 @@ func (rw *rowWriter) end() {
 	rw.w.Flush()
 }
 
-// copyRIB : peer 하나의 경로표를 복사 (읽기 잠금 안에서), 프리픽스 순
-func copyRIB(r *router, p *peer, afi string) []ribRow {
-	rows := make([]ribRow, 0, len(p.rib4)+len(p.rib6))
+// copyRIB : peer 하나 (보기 v, -1 = 주 보기) 의 경로표를 복사 (읽기 잠금 안에서), 프리픽스 순
+func copyRIB(r *router, p *peer, v int, afi string) []ribRow {
+	rv := p.view(v)
+	rows := make([]ribRow, 0, rv.rib4.paths()+rv.rib6.paths())
 	base := ribRow{router: r.ip, routerName: r.sysName, peer: p.ip.String(), peerAS: p.as}
 	if afi != "6" {
-		for k, v := range p.rib4 {
+		for k, v := range rv.rib4.all() {
 			x := base
-			x.pfx, x.rt = k.prefix(), v
+			x.pfx = k.prefix()
+			x.setPath(v)
 			rows = append(rows, x)
 		}
 	}
 	if afi != "4" {
-		for k, v := range p.rib6 {
+		for k, v := range rv.rib6.all() {
 			x := base
-			x.pfx, x.rt = k.prefix(), v
+			x.pfx = k.prefix()
+			x.setPath(v)
 			rows = append(rows, x)
 		}
 	}
@@ -582,7 +739,7 @@ func copyRIB(r *router, p *peer, afi string) []ribRow {
 func sortRows(rows []ribRow) {
 	slices.SortFunc(rows, func(a, b ribRow) int {
 		return cmp.Or(cmpAddr(a.router, b.router), strings.Compare(a.peer, b.peer), a.pfx.Addr().Compare(b.pfx.Addr()),
-			a.pfx.Bits()-b.pfx.Bits())
+			a.pfx.Bits()-b.pfx.Bits(), cmp.Compare(a.pathID, b.pathID))
 	})
 }
 
@@ -621,6 +778,8 @@ func (c *collector) peersOf(ip, peerIP string) (list []routerPeer, ok bool) {
 // listFilter : 경로 목록의 질의 . 순서 afi -> p -> origin -> path_as -> offset -> limit
 type listFilter struct {
 	afi     string        // "4" / "6" / "" (모두)
+	view    int           // view= 보기 (-1 = peer 의 주 보기, 0.3.0)
+	fam     family        // family= unicast 밖 경로 종류 (0 = unicast : afi 로 고름, 0.3.0 famrib.go)
 	p       netip.Prefix  // p= (없으면 IsValid() == false)
 	how     string        // exact | longest | covering | more
 	origin  *originFilter // origin_as / not_origin (nil = 거르지 않음)
@@ -639,6 +798,29 @@ func newListFilter(q url.Values) (*listFilter, error) {
 	var err error
 	if f.afi == "4" || f.afi == "6" {
 		f.applied = append(f.applied, "afi")
+	}
+	if f.view, err = parseView(q.Get("view")); err != nil {
+		return nil, err
+	}
+	if f.view >= 0 {
+		f.applied = append(f.applied, "view")
+	}
+	if s := q.Get("family"); s != "" {
+		fam, err := parseFamily(s)
+		if err != nil {
+			return nil, err
+		}
+		switch {
+		case fam == famOf(afiIPv4, safiUnicast): // unicast 는 afi 와 같음
+			f.afi = "4"
+		case fam == famOf(afiIPv6, safiUnicast):
+			f.afi = "6"
+		case ribSupported[fam]: // labeled / L3VPN / multicast / FlowSpec
+			f.fam = fam
+		default:
+			return nil, fmt.Errorf("family=%q : no route tables for this address family", s)
+		}
+		f.applied = append(f.applied, "family")
 	}
 	if s := q.Get("p"); s != "" {
 		if f.p, f.how, err = parseQuery(s); err != nil {
@@ -723,13 +905,13 @@ func pathHas(asPath string, set map[uint32]bool) bool {
 
 // kv4 / kv6 : 정렬용 작은 복사본 (열쇠 + 경로 = 16 / 32 바이트). 열쇠 순 = 프리픽스 순 (주소, 그다음 길이)
 type kv4 struct {
-	k  key4
-	rt route
+	k key4
+	p pathOf
 }
 
 type kv6 struct {
-	k  key6
-	rt route
+	k key6
+	p pathOf
 }
 
 // peerScan : peer 하나의 걸러진 경로를 프리픽스 순으로 훑음 (잠금 -> 열쇠만 복사 -> 풀고 정렬, 거름).
@@ -748,9 +930,18 @@ func (f *listFilter) peerScan(rp routerPeer, lo, hi int, each func(*ribRow)) int
 			n++
 		}
 	}
+	if f.fam != 0 { // unicast 밖 종류 (famrib.go) : 표를 복사해 훑음 (RD, 프리픽스 순)
+		r.mu.RLock()
+		rows := famMatch(r, p, f.view, f.fam, f.p, f.how)
+		r.mu.RUnlock()
+		for i := range rows {
+			visit(&rows[i])
+		}
+		return n
+	}
 	if f.p.IsValid() && f.how != "more" { // exact / longest / covering : 몇 줄뿐 (길이마다 한 번씩 찾음)
 		r.mu.RLock()
-		rows := match(r, p, f.p, f.how)
+		rows := match(r, p, f.view, f.p, f.how)
 		r.mu.RUnlock()
 		slices.SortFunc(rows, func(a, b ribRow) int { return a.pfx.Bits() - b.pfx.Bits() }) // 같은 주소 : 짧은 것부터
 		for i := range rows {
@@ -762,32 +953,35 @@ func (f *listFilter) peerScan(rp routerPeer, lo, hi int, each func(*ribRow)) int
 	var v6 []kv6
 	r.mu.RLock()
 	base := ribRow{router: r.ip, routerName: r.sysName, peer: p.ip.String(), peerAS: p.as}
+	rv := p.view(f.view)
 	if f.afi != "6" && (!f.p.IsValid() || f.p.Addr().Is4()) {
-		v4 = make([]kv4, 0, len(p.rib4))
-		for k, v := range p.rib4 {
+		v4 = make([]kv4, 0, rv.rib4.paths())
+		for k, v := range rv.rib4.all() {
 			v4 = append(v4, kv4{k, v})
 		}
 	}
 	if f.afi != "4" && (!f.p.IsValid() || f.p.Addr().Is6()) {
-		v6 = make([]kv6, 0, len(p.rib6))
-		for k, v := range p.rib6 {
+		v6 = make([]kv6, 0, rv.rib6.paths())
+		for k, v := range rv.rib6.all() {
 			v6 = append(v6, kv6{k, v})
 		}
 	}
 	r.mu.RUnlock()
 	if sortNeeded {
-		slices.SortFunc(v4, func(a, b kv4) int { return cmp.Compare(a.k, b.k) })
+		slices.SortFunc(v4, func(a, b kv4) int { return cmp.Or(cmp.Compare(a.k, b.k), cmp.Compare(a.p.id, b.p.id)) })
 		slices.SortFunc(v6, func(a, b kv6) int {
-			return cmp.Or(cmp.Compare(a.k.hi, b.k.hi), cmp.Compare(a.k.lo, b.k.lo), cmp.Compare(a.k.n, b.k.n))
+			return cmp.Or(cmp.Compare(a.k.hi, b.k.hi), cmp.Compare(a.k.lo, b.k.lo), cmp.Compare(a.k.n, b.k.n), cmp.Compare(a.p.id, b.p.id))
 		})
 	}
 	x := base
 	for _, e := range v4 { // v4 다음 v6 (예전 정렬과 같음)
-		x.pfx, x.rt = e.k.prefix(), e.rt
+		x.pfx = e.k.prefix()
+		x.setPath(e.p)
 		visit(&x)
 	}
 	for _, e := range v6 {
-		x.pfx, x.rt = e.k.prefix(), e.rt
+		x.pfx = e.k.prefix()
+		x.setPath(e.p)
 		visit(&x)
 	}
 	return n
@@ -830,6 +1024,10 @@ func (c *collector) apiPeerPrefixes(w http.ResponseWriter, req *http.Request) {
 		httpErr(w, 400, "%v", err)
 		return
 	}
+	if f.fam != 0 && !c.rib[f.fam] {
+		httpErr(w, 409, "route tables are off for %s (-rib)", f.fam)
+		return
+	}
 	list, ok := c.peersOf(req.PathValue("ip"), req.PathValue("peer"))
 	if !ok || len(list) == 0 {
 		httpErr(w, 404, "router %s / peer %s not found", req.PathValue("ip"), req.PathValue("peer"))
@@ -842,6 +1040,10 @@ func (c *collector) apiRouterPrefixes(w http.ResponseWriter, req *http.Request) 
 	f, err := newListFilter(req.URL.Query())
 	if err != nil {
 		httpErr(w, 400, "%v", err)
+		return
+	}
+	if f.fam != 0 && !c.rib[f.fam] {
+		httpErr(w, 409, "route tables are off for %s (-rib)", f.fam)
 		return
 	}
 	list, ok := c.peersOf(req.PathValue("ip"), "")
@@ -915,37 +1117,37 @@ func parseQuery(s string) (netip.Prefix, string, error) {
 	return netip.PrefixFrom(p.Addr().Unmap(), p.Bits()).Masked(), "exact", nil
 }
 
-// lookup : peer 하나에서 길이 n 으로 자른 q 가 있는가
-func lookup(p *peer, q netip.Prefix, n int) (route, netip.Prefix, bool) {
+// lookup : 보기 하나의 경로표에서 길이 n 으로 자른 q 의 경로들 (Add-Path 면 여럿, 없으면 nil)
+func lookup(rv *ribView, q netip.Prefix, n int) ([]pathOf, netip.Prefix) {
 	m, _ := q.Addr().Prefix(n)
-	var rt route
-	var ok bool
 	if q.Addr().Is4() {
-		rt, ok = p.rib4[k4(m.Addr(), n)]
-	} else {
-		rt, ok = p.rib6[k6(m.Addr(), n)]
+		return rv.rib4.lookup(k4(m.Addr(), n)), m
 	}
-	return rt, m, ok
+	return rv.rib6.lookup(k6(m.Addr(), n)), m
 }
 
-// match : peer 하나에서 exact / longest / covering 찾기 (길이마다 한 번씩 찾아봄 = 빠름)
-func match(r *router, p *peer, q netip.Prefix, how string) []ribRow {
+// match : peer 하나 (보기 v, -1 = 주 보기) 에서 exact / longest / covering 찾기 (길이마다 한 번씩 찾아봄 = 빠름)
+func match(r *router, p *peer, v int, q netip.Prefix, how string) []ribRow {
 	base := ribRow{router: r.ip, routerName: r.sysName, peer: p.ip.String(), peerAS: p.as}
+	rv := p.view(v)
 	var out []ribRow
-	add := func(pfx netip.Prefix, rt route) {
-		x := base
-		x.pfx, x.rt = pfx, rt
-		out = append(out, x)
+	add := func(pfx netip.Prefix, ps []pathOf) {
+		for _, p := range ps {
+			x := base
+			x.pfx = pfx
+			x.setPath(p)
+			out = append(out, x)
+		}
 	}
 	switch how {
 	case "exact":
-		if rt, m, ok := lookup(p, q, q.Bits()); ok {
-			add(m, rt)
+		if ps, m := lookup(rv, q, q.Bits()); ps != nil {
+			add(m, ps)
 		}
 	case "longest", "covering":
 		for n := q.Bits(); n >= 0; n-- {
-			if rt, m, ok := lookup(p, q, n); ok {
-				add(m, rt)
+			if ps, m := lookup(rv, q, n); ps != nil {
+				add(m, ps)
 				if how == "longest" {
 					break
 				}
@@ -999,7 +1201,7 @@ func (c *collector) apiReset(w http.ResponseWriter, req *http.Request) {
 func (c *collector) needRIB(h http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, req *http.Request) {
 		if c.noRIB {
-			httpErr(w, 409, "route tables are off (-rib=false)")
+			httpErr(w, 409, "route tables are off (-rib=none)")
 			return
 		}
 		h(w, req)

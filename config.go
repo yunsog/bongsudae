@@ -30,6 +30,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 )
 
 const defConfig = "/etc/bongsudae/bongsudae.conf"
@@ -56,12 +57,6 @@ var confKeys = map[string]string{
 
 	"http.listen": "http",
 	"http.allow":  "http-allow",
-}
-
-// retiredSections : 없앤 구역. 남은 설정 파일이 시작을 막지 않게 키는 받고 무시 (기록 한 줄).
-// [export] = (프리픽스 -> origin AS) 파일 내보내기, 0.2.0-dev 에만 있었고 11-02 뺌 (사용자). 다음 판에서 이 표를 지움
-var retiredSections = map[string]string{
-	"export": "the (prefix -> origin AS) file export was removed in 0.2.0",
 }
 
 // confEntry : 설정 파일 한 항목 (줄 번호는 오류 표시용)
@@ -115,10 +110,6 @@ func parseConf(r io.Reader) ([]confEntry, error) {
 			return nil, fmt.Errorf("line %d : not \"key = value\" : %q", n, line)
 		}
 		key := section + "." + strings.TrimSpace(k)
-		if why, old := retiredSections[section]; old {
-			log.Printf("config line %d : [%s] %s ignored (%s)", n, section, strings.TrimSpace(k), why)
-			continue
-		}
 		if _, ok := confKeys[key]; !ok {
 			return nil, fmt.Errorf("line %d : unknown key [%s] %s", n, section, strings.TrimSpace(k))
 		}
@@ -257,7 +248,7 @@ func reloadConf(who string) error {
 		if e, ok := file[k]; ok {
 			nv = e.Val
 		}
-		if nv == fl.Value.String() {
+		if sameValue(fl, nv) {
 			continue
 		}
 		ch := confChange{k, name, fl.Value.String(), nv}
@@ -296,6 +287,20 @@ func reloadConf(who string) error {
 		log.Printf("config reloaded : restart needed for (running values kept) : %s", strings.Join(s, ", "))
 	}
 	return nil
+}
+
+// sameValue : 설정 글자 nv 가 지금 값과 같은가. 시간 값은 길이로 비교 ("90m" = "1h30m0s", 글자로 비교하면 reload 마다 거짓 경고)
+func sameValue(fl *flag.Flag, nv string) bool {
+	if nv == fl.Value.String() {
+		return true
+	}
+	if g, ok := fl.Value.(flag.Getter); ok {
+		if d, ok := g.Get().(time.Duration); ok {
+			nd, err := time.ParseDuration(nv)
+			return err == nil && nd == d
+		}
+	}
+	return false
 }
 
 func confFail(err error) error {
