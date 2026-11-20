@@ -1,5 +1,58 @@
 # Changelog
 
+## 0.4.0 (2026-11-20)
+
+Existing topics and their message format are unchanged, except that the `peer`
+topic now fills `table_name` and `info_data`. Upgrading from 0.3.0 is hitless
+(`bongsudae -upgrade`). **Add a `rib` line to the configuration before
+upgrading** if you use route counts or prefix lookups (see Changed).
+
+### New
+
+- **Grafana dashboard example** : `deploy/grafana/bongsudae.json` for the
+  `/metrics` numbers (routers, peers, routes, BMP / Kafka rates, errors,
+  memory, a per-router table). Import it and pick a Prometheus data source.
+- **Peer Up information TLVs** : the `peer` topic now fills `table_name`
+  (TLV 3, VRF / Table Name; RFC 9069, optional, `global` for the
+  default Loc-RIB) on up and down
+  messages, and `info_data` (TLV 0, free text) on up messages. Both were
+  always empty before. The peer detail API shows them too.
+- **Every address family goes to Kafka** (no routing tables for the new
+  ones): BGP-LS (`ls_node`, `ls_link`, `ls_prefix`, OpenBMP schema fields +
+  `rd`), VPLS (`l2vpn_vpls`), MVPN (`mvpn`), SR Policy (`sr_policy`),
+  RT Constraint (`rt_constraint`), and `other_family` for everything else
+  (MDT, Classful Transport, VPN multicast, CAR, MUP, unknown families as
+  NLRI hex). Nothing is dropped any more; `other_families` in the stats now
+  counts routes sent as hex only. Formats: docs/en/kafka.md 3.5 - 3.11.
+
+### Changed
+
+- **License changed from ISC to Apache-2.0** (LICENSE, new NOTICE file,
+  `SPDX-License-Identifier` line in each Go file). 0.3.0 and earlier remain ISC.
+- **Routing tables are off by default** for every address family, unicast
+  included (`bmp.rib` / `-rib` default `none`). Turn them on per family in
+  the config file, e.g.
+  `rib = ipv4-unicast, ipv6-unicast, vpnv4, vpnv6, ipv4-flowspec, ipv6-flowspec`.
+  Kafka output does not depend on it; route counts, prefix lists and lookups
+  need the table (409 otherwise). **Upgrading from 0.3 without a `rib` line
+  turns the IPv4 / IPv6 unicast tables off.**
+- Wording: "route table" is now "routing table" in the documentation.
+- Kafka client franz-go v1.22.2 -> v1.22.3 (kmsg v1.15.1), patch release.
+- **Build with `CGO_ENABLED=0`** (README, manual). The binary then does not
+  use libc, so a libc security update does not make needrestart restart the
+  collector (a restart makes every router resend its routes). Same size; the
+  release archives were already built this way.
+- `bongsudae_other_afi_total` (and `others` in the stats) now counts routes of
+  unknown shape sent as NLRI hex to `other_family`; 0.3 counted dropped routes.
+
+### Fixed
+
+- **Per-family Loc-RIB Peer Ups** (RFC 9069 6.1.1, e.g. Junos sends inet.0
+  and inet6.0 as two Peer Ups with the same distinguisher and BGP ID): a
+  Peer Up for a family not yet seen on an up Loc-RIB peer is merged instead
+  of starting a new session, so it no longer clears the other family's
+  routes and negotiated families.
+
 ## 0.3.0 (2026-11-11)
 
 Existing topics (`unicast_prefix`, `peer`, `router`, `bmp_raw`) and their
@@ -24,16 +77,16 @@ is received in two or more views.
     our own (43 fields, OpenBMP has none).
   - Other families (BGP-LS, MVPN, RT Constraint ...) are counted per family
     and dropped (`other_families` in the stat line, `/api/stats`, `/metrics`).
-- **Views** : every BMP view gets its own route table - Adj-RIB-In pre / post
+- **Views** : every BMP view gets its own routing table - Adj-RIB-In pre / post
   policy, Adj-RIB-Out pre / post policy (RFC 8671) and Loc-RIB (RFC 9069).
   API `view` / `views` / `view=`. Loc-RIB rows are the rows whose `peer_ip`
   is `0.0.0.0`.
-- **Add-Path** (RFC 7911) : one route per path ID in the route tables, API
+- **Add-Path** (RFC 7911) : one route per path ID in the routing tables, API
   `path_id`, `paths_v4` / `paths_v6`.
-- `bmp.rib` (`-rib`) is a list of families to keep route tables for, e.g.
+- `bmp.rib` (`-rib`) is a list of families to keep routing tables for, e.g.
   `ipv4-unicast, ipv6-unicast, vpnv4, vpnv6, ipv4-flowspec, ipv6-flowspec`
   (`none` = forward only). The 0.2 values `true` / `false` still work.
-- API `family=`, `family_routes` (route tables of the other families) and
+- API `family=`, `family_routes` (routing tables of the other families) and
   `rule=` (FlowSpec rules).
 - Connections from addresses outside `bmp.allow` are logged (once a minute per
   address).
@@ -63,9 +116,9 @@ is an ordinary restart (routers reconnect once); from 0.2.0 on, use
 ### New
 
 - **Hitless upgrade** : `bongsudae -upgrade` (or SIGUSR2) hands the router
-  connections, peer state and route tables to the new binary under the same pid.
+  connections, peer state and routing tables to the new binary under the same pid.
   Routers do not reconnect. With 77 million routes the routers paused 5.5 - 9.5 s;
-  the route tables load in the background. If anything fails, the old process
+  the routing tables load in the background. If anything fails, the old process
   keeps running.
 - **JSON output** : `kafka.format = json` (`-format json`) writes one JSON object
   per line instead of the OpenBMP TSV, with the same topics, keys and message
@@ -77,7 +130,7 @@ is an ordinary restart (routers reconnect once); from 0.2.0 on, use
 - **Kafka key buckets** : `kafka.key_buckets = N` spreads the rows of a big peer
   over N keys by prefix, keeping the order per router + peer + prefix.
 - Topic settings `kafka.partitions`, `kafka.replication`, `kafka.retention`.
-- `bmp.rib = false` : forward only, no route tables (much less memory).
+- `bmp.rib = false` : forward only, no routing tables (much less memory).
 - BMP Statistics Reports in the peer detail; per-router one-minute statistics
   (`/api/stats?by_router=1`).
 - systemd watchdog (`WatchdogSec=180` in the example unit file).

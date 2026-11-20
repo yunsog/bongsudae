@@ -1,4 +1,6 @@
-// flowspec.go : FlowSpec (RFC 8955 IPv4, RFC 8956 IPv6, VPN = SAFI 134) 해석, Kafka 줄, 경로표 (0.3.0 2 차).
+// SPDX-License-Identifier: Apache-2.0
+
+// flowspec.go : FlowSpec (RFC 8955 IPv4, RFC 8956 IPv6, VPN = SAFI 134) 해석, Kafka 줄, 라우팅 테이블 (0.3.0 2 차).
 // 토픽 <prefix>.flowspec, 줄 = 봉수대가 정한 43 칸 (openbmp 스키마에 없음) : docs/kafka.md 3-4 장이 약속.
 //
 // NLRI 하나 = [path ID] + 길이 (1 바이트, 0xf0 이상이면 2 바이트 12 비트) + [RD 8 (VPN)] + 성분들 (종류 1 바이트 + 값).
@@ -37,7 +39,7 @@ func init() {
 type fsRule struct {
 	pathID uint32
 	rd     [8]byte
-	raw    string     // 규칙 바이트 (RD 뒤 성분들 : 해시 / 경로표 열쇠)
+	raw    string     // 규칙 바이트 (RD 뒤 성분들 : 해시 / 라우팅 테이블 열쇠)
 	comp   [14]string // 성분 1 ~ 13 의 글자 (0 은 안 씀)
 	dst    netip.Prefix
 }
@@ -415,7 +417,7 @@ func (c *collector) fsRow(b []byte, seq uint64, rp *rowPeer, a *attrs, nh string
 	return append(b, '}', '\n')
 }
 
-// ---- 경로표 (bmp.rib 에 ipv4-flowspec 등을 적을 때) ----
+// ---- 라우팅 테이블 (bmp.rib 에 ipv4-flowspec 등을 적을 때) ----
 
 // fsKey : (RD, 규칙 바이트) + 목적지 프리픽스 (찾기용, 규칙에서 정해짐)
 type fsKey struct {
@@ -426,7 +428,7 @@ type fsKey struct {
 
 func (k fsKey) prefix() netip.Prefix { return k.dst }
 
-// fsTable : FlowSpec 종류 하나의 경로표 (famTable)
+// fsTable : FlowSpec 종류 하나의 라우팅 테이블 (famTable)
 type fsTable struct {
 	f family
 	t ribTable[fsKey]

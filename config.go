@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 // config.go : 설정 파일 (기본 /etc/bongsudae/bongsudae.conf, ini 모양)
 //
 // 모양

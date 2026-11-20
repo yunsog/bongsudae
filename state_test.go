@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 // 상태 파일 시험 (무중단 판 올리기, 0.2.0)
 //
 // 큰 측정 (운영 전체 RIB 덤프, 약 20 분 + 메모리 15 GB) 은 환경 변수가 있을 때만 :
@@ -18,7 +20,7 @@ import (
 	"unique"
 )
 
-// ribDigest : 경로표 전체의 요약 (순서와 상관없음 : 경로마다 해시를 더함). 속성은 값으로 비교
+// ribDigest : 라우팅 테이블 전체의 요약 (순서와 상관없음 : 경로마다 해시를 더함). 속성은 값으로 비교
 func ribDigest(ps []*peer) (sum [4]uint64, n int) {
 	add := func(h [32]byte) {
 		for i := range sum {
@@ -54,7 +56,7 @@ func ribDigest(ps []*peer) (sum [4]uint64, n int) {
 	return
 }
 
-// 작은 경로표 왕복 : 쓰고 읽으면 같은 경로표 (빈 peer, v4 만, v6 만, 둘 다)
+// 작은 라우팅 테이블 왕복 : 쓰고 읽으면 같은 라우팅 테이블 (빈 peer, v4 만, v6 만, 둘 다)
 func TestStateRIBRoundTrip(t *testing.T) {
 	a1 := unique.Make(pathAttr{asPath: "64496 64497", originAS: 64497, nextHop: "192.0.2.1", origin: "igp", med: 10, localPref: 100,
 		community: "64496:1 64496:2", extComm: "rt=64496:1", largeComm: "64496:1:2", clusterList: "192.0.2.9", originatorID: "192.0.2.8", aggregator: "64497 192.0.2.7"})
@@ -102,7 +104,7 @@ func TestStateRIBRoundTrip(t *testing.T) {
 	}
 }
 
-// decodeInto : 덩어리 i -> ps[i] 경로표
+// decodeInto : 덩어리 i -> ps[i] 라우팅 테이블
 func decodeInto(ps []*peer) func(int, []byte) error {
 	return func(i int, b []byte) error {
 		tabs, _, err := decodeRIB(b, stateVersion, viewInPre)
@@ -131,7 +133,7 @@ func allPeers(c *collector) []*peer {
 	return ps
 }
 
-// 운영 전체 RIB 측정 : 덤프를 처리해 경로표를 채움 -> 상태 파일 쓰기 / 읽기 시간과 크기, 읽은 것이 같은지
+// 운영 전체 RIB 측정 : 덤프를 처리해 라우팅 테이블을 채움 -> 상태 파일 쓰기 / 읽기 시간과 크기, 읽은 것이 같은지
 func TestStateRIBDump(t *testing.T) {
 	dump := os.Getenv("BONGSUDAE_RIB_DUMP")
 	if dump == "" {
@@ -178,7 +180,7 @@ func TestStateRIBDump(t *testing.T) {
 	tw := time.Since(t1)
 	t.Logf("write : %d routes, %d MB, %s", wn, size>>20, tw.Round(time.Millisecond))
 
-	// 옛 경로표를 버리고 (새 프로세스처럼) 읽음
+	// 옛 라우팅 테이블을 버리고 (새 프로세스처럼) 읽음
 	c, ps = nil, nil
 	runtime.GC()
 	got := make([]*peer, len(keys))

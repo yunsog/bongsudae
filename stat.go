@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 // 통계 : 1 분마다 기록에 한 줄
 package main
 
@@ -10,7 +12,7 @@ import (
 type stats struct {
 	bmpType    [bmpTypeCount + 1]int // BMP 종류별 건수 (마지막 = 모르는 종류)
 	errors     int                   // 해석 오류 메시지 수
-	others     int                   // 해석기가 없는 종류의 MP_REACH / UNREACH (VPN 등, 버림)
+	others     int                   // 모양을 몰라 NLRI hex 로만 낸 경로 (0.4.0~ other_family 토픽, 0.3 은 버림)
 	otherFam   map[family]int        // 그 종류마다 (0.3.0, 없으면 nil)
 	famRows    int                   // unicast 밖 종류의 줄 (labeled_unicast_prefix, l3vpn, multicast_prefix : 0.3.0)
 	add        int                   // add 줄
@@ -46,7 +48,7 @@ func (s *stats) String() string {
 	if s.famRows > 0 {
 		p = append(p, fmt.Sprintf("family_rows=%d", s.famRows))
 	}
-	if len(s.otherFam) > 0 { // 버린 종류 (0.3.0) : "other_families: bgp-ls=12,rt-constraint=3"
+	if len(s.otherFam) > 0 { // 모양을 모르는 종류 (0.3.0) : "other_families: 99/9=12,bgp-ls=3"
 		p = append(p, "other_families: "+familyCounts(s.otherFam))
 	}
 	return strings.Join(p, " ")

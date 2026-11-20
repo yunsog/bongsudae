@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 package main
 
 // (11-05) 연결 자리 (Initiation 전 / 라우터 나눔) 와 정보 TLV 글자 (제곱 -> 한 번 훑음) 시험

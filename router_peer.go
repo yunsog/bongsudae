@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 // openbmp v1.7 router / peer 메시지 (openbmpd 출력과 같게, 10-28 표본으로 확인)
 //
 // router (12 필드) : action seq name hash ip description term_code term_reason init_data term_data timestamp bgp_id
@@ -157,6 +159,7 @@ func (c *collector) peerRow(r *router, h *peerHdr, action string, now time.Time)
 	f[27] = b01(h.addr.Is4())                                 // isIPv4
 	f[28] = b01(h.typ == peerTypeLocRIB)                      // isLocRIB
 	f[29] = b01(h.typ == peerTypeLocRIB && h.flags&0x80 != 0) // isLocRIBFiltered
+	f[30] = p.tableName                                       // (0.4.0) Peer Up 의 TLV 3 (down 은 그 세션의 이름, up 은 peerUpMsg 가 그 메시지 것으로)
 	r.peerSeq++
 	r.stat.peerMsgs++
 	return f
@@ -164,8 +167,10 @@ func (c *collector) peerRow(r *router, h *peerHdr, action string, now time.Time)
 
 // peerUpMsg : Peer Up -> peer up 메시지 (local 주소 / 포트, 두 OPEN)
 // sent / recv 가 nil 이면 (OPEN 없는 Peer Up) local_asn, local_bgp_id, 능력, holddown 은 빈칸
-func (c *collector) peerUpMsg(r *router, h *peerHdr, local netip.Addr, lport, rport uint16, sent, recv *openMsg, now time.Time) outMsg {
+// info / table = 이 Peer Up 의 TLV 0 / 3 (같은 Loc-RIB 에 종류를 더한 Peer Up 도 그 메시지 것만)
+func (c *collector) peerUpMsg(r *router, h *peerHdr, local netip.Addr, lport, rport uint16, sent, recv *openMsg, info, table string, now time.Time) outMsg {
 	f := c.peerRow(r, h, "up", now)
+	f[16], f[30] = info, table
 	f[11], f[13], f[14] = u32(uint32(rport)), local.String(), u32(uint32(lport))
 	if sent != nil && recv != nil {
 		f[12], f[15] = u32(sent.as), sent.bgpID

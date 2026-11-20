@@ -1,4 +1,6 @@
-// 웹 API : 라우터 / peer 현황, 경로표 조회 (GET 만, JSON 기본, 큰 목록은 ?format=text 로 탭 구분 글자)
+// SPDX-License-Identifier: Apache-2.0
+
+// 웹 API : 라우터 / peer 현황, 라우팅 테이블 조회 (GET 만, JSON 기본, 큰 목록은 ?format=text 로 탭 구분 글자)
 //
 //	/api/routers                                   라우터 전체
 //	/api/routers/{ip}                              라우터 하나 + 그 peer 들
@@ -80,7 +82,7 @@ func parseHTTPAllow(s string) ([]netip.Prefix, error) {
 	return parseAllow(s)
 }
 
-// isHeavy : 경로표를 훑는 요청인가 (/prefix 찾기, /prefixes 목록) = 무거운 자리를 씀
+// isHeavy : 라우팅 테이블을 훑는 요청인가 (/prefix 찾기, /prefixes 목록) = 무거운 자리를 씀
 func isHeavy(path string) bool {
 	return strings.HasSuffix(path, "/prefix") || strings.HasSuffix(path, "/prefixes")
 }
@@ -232,7 +234,7 @@ type peerJSON struct {
 	RoutesV6   int            `json:"routes_v6"`
 	PathsV4    int            `json:"paths_v4,omitempty"` // Add-Path 세션만 (0.3.0) : 경로 수 (routes_v4 = 프리픽스 수)
 	PathsV6    int            `json:"paths_v6,omitempty"`
-	FamRoutes  map[string]int `json:"family_routes,omitempty"` // 0.3.0 : 경로표를 든 다른 종류마다 경로 수 (bmp.rib 에 vpnv4 등)
+	FamRoutes  map[string]int `json:"family_routes,omitempty"` // 0.3.0 : 라우팅 테이블을 든 다른 종류마다 경로 수 (bmp.rib 에 vpnv4 등)
 	LastUpdate string         `json:"last_update,omitempty"`
 	Adds       uint64         `json:"adds"`
 	Dels       uint64         `json:"dels"`
@@ -257,8 +259,10 @@ type peerDetail struct {
 	HoldRecv   uint16   `json:"hold_recv"`
 	SentCaps   string   `json:"sent_caps"`
 	RecvCaps   string   `json:"recv_caps"`
-	Families   []string `json:"families,omitempty"` // 0.3.0 : 두 OPEN 이 함께 알린 경로 종류 (ipv4-unicast, vpnv4 ...). 해석하는 것은 ipv4 / ipv6-unicast 뿐 (나머지는 세고 버림)
-	AddPath    []string `json:"add_path,omitempty"` // 0.3.0 : 그중 Add-Path 로 받는 종류
+	InfoData   string   `json:"info_data,omitempty"`  // 0.4.0 : Peer Up 정보 TLV 0 (자유 글자)
+	TableName  string   `json:"table_name,omitempty"` // 0.4.0 : Peer Up 정보 TLV 3 (VRF / 표 이름, Loc-RIB)
+	Families   []string `json:"families,omitempty"`   // 0.3.0 : 두 OPEN 이 함께 알린 경로 종류 (ipv4-unicast, vpnv4 ...). 해석하는 것은 ipv4 / ipv6-unicast 뿐 (나머지는 세고 버림)
+	AddPath    []string `json:"add_path,omitempty"`   // 0.3.0 : 그중 Add-Path 로 받는 종류
 	History    []string `json:"history"`
 	// BMP Stats Report (0.2.0) : 라우터가 보낸 마지막 값 (없으면 빠짐). 이름 = IANA 종류, 주소 종류마다는 _<afi>_<safi>
 	BMPStats   map[string]uint64 `json:"bmp_stats,omitempty"`
@@ -434,7 +438,7 @@ func (c *collector) peerView(r *router, p *peer, detail bool) peerJSON {
 		d := &peerDetail{PrePolicy: p.flags&flagL == 0, AdjRibIn: p.flags&flagO == 0 && p.typ != peerTypeLocRIB,
 			AS4: p.flags&flagA == 0, LocalIP: p.localIP, LocalPort: p.localPort, RemotePort: p.rmtPort,
 			HoldSent: p.holdSent, HoldRecv: p.holdRecv, SentCaps: p.sentCaps, RecvCaps: p.recvCaps,
-			Families: familyList(p.fams), AddPath: familyList(p.addPathFams)}
+			InfoData: p.infoData, TableName: p.tableName, Families: familyList(p.fams), AddPath: familyList(p.addPathFams)}
 		for _, e := range p.hist {
 			d.History = append(d.History, tstr(e.t)+" "+e.text)
 		}
@@ -608,7 +612,7 @@ type ribRow struct {
 	rule                     bool   // FlowSpec 규칙 (속성 labels 칸 = 규칙 글자, 0.3.0)
 }
 
-// setPath : 경로표에서 꺼낸 경로 하나를 줄에
+// setPath : 라우팅 테이블에서 꺼낸 경로 하나를 줄에
 func (x *ribRow) setPath(p pathOf) { x.rt, x.pathID, x.addPath = p.rt, p.id, p.addPath }
 
 func (x *ribRow) json() routeJSON {
@@ -712,7 +716,7 @@ func (rw *rowWriter) end() {
 	rw.w.Flush()
 }
 
-// copyRIB : peer 하나 (보기 v, -1 = 주 보기) 의 경로표를 복사 (읽기 잠금 안에서), 프리픽스 순
+// copyRIB : peer 하나 (보기 v, -1 = 주 보기) 의 라우팅 테이블을 복사 (읽기 잠금 안에서), 프리픽스 순
 func copyRIB(r *router, p *peer, v int, afi string) []ribRow {
 	rv := p.view(v)
 	rows := make([]ribRow, 0, rv.rib4.paths()+rv.rib6.paths())
@@ -1117,7 +1121,7 @@ func parseQuery(s string) (netip.Prefix, string, error) {
 	return netip.PrefixFrom(p.Addr().Unmap(), p.Bits()).Masked(), "exact", nil
 }
 
-// lookup : 보기 하나의 경로표에서 길이 n 으로 자른 q 의 경로들 (Add-Path 면 여럿, 없으면 nil)
+// lookup : 보기 하나의 라우팅 테이블에서 길이 n 으로 자른 q 의 경로들 (Add-Path 면 여럿, 없으면 nil)
 func lookup(rv *ribView, q netip.Prefix, n int) ([]pathOf, netip.Prefix) {
 	m, _ := q.Addr().Prefix(n)
 	if q.Addr().Is4() {
@@ -1153,7 +1157,7 @@ func match(r *router, p *peer, v int, q netip.Prefix, how string) []ribRow {
 				}
 			}
 		}
-	} // more 는 find.go 의 moreMany (경로표를 한 번 훑어 여러 프리픽스를 함께)
+	} // more 는 find.go 의 moreMany (라우팅 테이블을 한 번 훑어 여러 프리픽스를 함께)
 	return out
 }
 
@@ -1197,7 +1201,7 @@ func (c *collector) apiReset(w http.ResponseWriter, req *http.Request) {
 		Note: "the router reconnects (interval set on the router) and sends Initiation, Peer Up and its full tables again. Progress: peers_synced"})
 }
 
-// needRIB : 경로표가 필요한 API. -rib=false 면 409 (0.2.0)
+// needRIB : 라우팅 테이블이 필요한 API. -rib=false 면 409 (0.2.0)
 func (c *collector) needRIB(h http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, req *http.Request) {
 		if c.noRIB {

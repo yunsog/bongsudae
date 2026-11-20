@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 // metrics.go : GET /metrics (0.2.0) = Prometheus 글자 꼴 (text exposition format 0.0.4), 라이브러리 없이.
 //
 // Prometheus 가 주기적으로 (보통 15 초 ~ 1 분) 이 주소를 불러 수를 모으고, Grafana 그래프 / 경보를 만든다.
@@ -173,7 +175,7 @@ func (c *collector) apiMetrics(w http.ResponseWriter, req *http.Request) {
 	m.val("bongsudae_kafka_messages_total", float64(cum.routerMsgs), "kind", "router")
 	m.val("bongsudae_kafka_messages_total", float64(cum.peerMsgs), "kind", "peer")
 	m.val("bongsudae_kafka_messages_total", float64(raw), "kind", "bmp_raw")
-	m.head("bongsudae_other_afi_total", "counter", "MP_REACH / MP_UNREACH of address families other than IPv4 / IPv6 unicast (counted, not forwarded).")
+	m.head("bongsudae_other_afi_total", "counter", "Routes of unknown shape sent only as NLRI hex to the other_family topic (0.3 : counted and dropped).")
 	m.val("bongsudae_other_afi_total", float64(cum.others))
 	m.head("bongsudae_other_family_total", "counter", "The same, per address family (e.g. bgp-ls, rt-constraint).")
 	fs := make([]family, 0, len(cum.otherFam))

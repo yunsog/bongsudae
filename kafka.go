@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 // Kafka : 보내기 (unicast_prefix) 와 읽기 (bmp_raw, 그림자 실행용)
 //
 // Kafka 가 고장 날 때 (10-29 : KRaft 로 바꾸며 토픽을 다시 만듦 -> 예전 토픽 ID 로 계속 읽어 오류가 23 분에 4 GB 기록) :

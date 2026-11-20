@@ -1,4 +1,6 @@
-// 라우터 / peer 현황과 peer 별 경로표 (RIB) : 웹 API (api.go) 가 읽음
+// SPDX-License-Identifier: Apache-2.0
+
+// 라우터 / peer 현황과 peer 별 라우팅 테이블 (RIB) : 웹 API (api.go) 가 읽음
 //
 // 경로 수 = 지금 살아 있는 프리픽스 수 (add / del 횟수가 아님) :
 //
@@ -6,7 +8,7 @@
 //	add (이미 있음)        속성만 바꿈 (수 그대로, 100 번 와도 1 개)
 //	del (있음)             뺌 -1
 //	del (없음)             무시
-//	Peer Down / 새 Peer Up / 라우터 끊김 -> 그 peer 경로표를 비움 (0)
+//	Peer Down / 새 Peer Up / 라우터 끊김 -> 그 peer 라우팅 테이블을 비움 (0)
 //
 // 열쇠 = (프리픽스, 길이). Add-Path 의 path id 는 넣지 않음 (쓰는 곳 없음, 10-28 표본).
 // 같은 속성 묶음은 unique.Make 로 한 번만 저장 (어느 경로도 안 쓰면 GC 가 지움).
@@ -41,7 +43,7 @@ type pathAttr struct {
 	labels       string // 라벨 "16001,3" (경로 종류 표만, 0.3.0 famrib.go. unicast 는 늘 빈칸)
 }
 
-// route : 경로표의 값 하나 = 속성 (공유) + 마지막 add 시각
+// route : 라우팅 테이블의 값 하나 = 속성 (공유) + 마지막 add 시각
 type route struct {
 	a unique.Handle[pathAttr]
 	t uint32 // unix 초
@@ -101,7 +103,7 @@ type peer struct {
 	bmpStatsAt time.Time
 
 	up     bool
-	gotUp  bool // 이번 BMP 세션에서 Peer Up 을 받음 = 경로표가 처음부터 정확
+	gotUp  bool // 이번 BMP 세션에서 Peer Up 을 받음 = 라우팅 테이블이 처음부터 정확
 	noOpen bool // Peer Up 에 OPEN 이 없었음 (RFC 7854 위반)
 	since  time.Time
 
@@ -110,6 +112,8 @@ type peer struct {
 	localPort, rmtPort   uint16
 	holdSent, holdRecv   uint16
 	sentCaps, recvCaps   string
+	infoData             string // (0.4.0) Peer Up 정보 TLV 0 (자유 글자) -> peer 메시지 info_data
+	tableName            string // (0.4.0) Peer Up 정보 TLV 3 (VRF / Table Name, RFC 9069 5.2.1 : 선택, 기본 표는 "global") -> table_name
 	addPathV4, addPathV6 bool
 	famV4, famV6         bool     // 협상된 unicast 종류 (OPEN 둘 다 알린 것) = End-of-RIB 를 기다릴 것
 	fams                 []family // 협상된 경로 종류 모두 (0.3.0, API detail.families)
@@ -118,11 +122,11 @@ type peer struct {
 	downReason string
 	hist       []event
 
-	// 보기마다 경로표와 수 (0.3.0) : nil = 그 보기로 받은 적 없음 (이번 세션). 보통 In pre 하나만
+	// 보기마다 라우팅 테이블과 수 (0.3.0) : nil = 그 보기로 받은 적 없음 (이번 세션). 보통 In pre 하나만
 	views [nViews]*ribView
 
-	// 무중단 판 올리기 (0.2.0, handover.go) 뒤 경로표를 뒤에서 읽는 동안 : 경로표 바꾸기는 ribLog 에 모았다가
-	// 읽은 경로표에 차례로 (ribLoaded). 그 사이 경로표를 비우면 (Peer Up / Down) 기다림을 끝냄 = 읽은 것은 버림
+	// 무중단 판 올리기 (0.2.0, handover.go) 뒤 라우팅 테이블을 뒤에서 읽는 동안 : 라우팅 테이블 바꾸기는 ribLog 에 모았다가
+	// 읽은 라우팅 테이블에 차례로 (ribLoaded). 그 사이 라우팅 테이블을 비우면 (Peer Up / Down) 기다림을 끝냄 = 읽은 것은 버림
 	ribWait bool
 	ribLog  []ribOp
 }
@@ -130,8 +134,8 @@ type peer struct {
 // ---- 보기 (0.3.0) ----
 //
 // BMP 는 같은 네이버의 경로를 여러 단계로 보낼 수 있음 : per-peer 머리의 Peer Type 과 깃발 L (post-policy), O (Adj-RIB-Out).
-// 단계마다 다른 경로 목록이므로 경로표를 따로 둠 (같은 표에 섞으면 서로 덮어쓰고 지움). Kafka 줄은 줄마다 isPrePolicy /
-// isAdjRibIn 으로 이미 구분해 냄 (이것은 경로표 / API 만의 일)
+// 단계마다 다른 경로 목록이므로 라우팅 테이블을 따로 둠 (같은 표에 섞으면 서로 덮어쓰고 지움). Kafka 줄은 줄마다 isPrePolicy /
+// isAdjRibIn 으로 이미 구분해 냄 (이것은 라우팅 테이블 / API 만의 일)
 const (
 	viewInPre   = iota // Adj-RIB-In pre-policy  : 네이버가 보낸 그대로 (RFC 7854)
 	viewInPost         // Adj-RIB-In post-policy : import 정책 뒤
@@ -171,17 +175,17 @@ func parseView(s string) (int, error) {
 	return 0, fmt.Errorf("view=%q : in-pre | in-post | out-pre | out-post | loc-rib", s)
 }
 
-// ribView : 보기 하나의 경로표와 수 (이번 세션)
+// ribView : 보기 하나의 라우팅 테이블과 수 (이번 세션)
 type ribView struct {
-	rib4 ribTable[key4] // IPv4 unicast 경로표 (ribtable.go)
+	rib4 ribTable[key4] // IPv4 unicast 라우팅 테이블 (ribtable.go)
 	rib6 ribTable[key6] // IPv6 unicast
 
 	eorV4, eorV6 time.Time // End-of-RIB 받은 시각
 	lastUpdate   time.Time
-	grewAt       uint32 // 새 프리픽스가 마지막으로 들어온 unix 초 (settled, 0.2.0). 경로표가 없으면 add 를 받은 때
+	grewAt       uint32 // 새 프리픽스가 마지막으로 들어온 unix 초 (settled, 0.2.0). 라우팅 테이블이 없으면 add 를 받은 때
 	adds, dels   uint64 // 이번 up 이후 받은 add / del 줄 수
 
-	fam map[family]famTable // unicast 밖 종류의 경로표 (0.3.0 famrib.go, bmp.rib 에 있는 종류만. 보통 nil)
+	fam map[family]famTable // unicast 밖 종류의 라우팅 테이블 (0.3.0 famrib.go, bmp.rib 에 있는 종류만. 보통 nil)
 }
 
 // emptyView : 받은 적 없는 보기를 읽을 때 (쓰지 않음)
@@ -244,7 +248,7 @@ func (p *peer) addPathCounts(rv *ribView) (n4, n6 int) {
 	return
 }
 
-// ribOp : 경로표를 읽는 동안 미뤄 둔 UPDATE 하나
+// ribOp : 라우팅 테이블을 읽는 동안 미뤄 둔 UPDATE 하나
 type ribOp struct {
 	v  int // 보기
 	u  *update
@@ -259,7 +263,7 @@ func (p *peer) addEvent(t time.Time, text string) {
 	p.hist = append(p.hist, event{t, text})
 }
 
-// clearRIB : 보기 모두의 경로표와 수를 버림 (세션 하나 = 보기 모두. 메모리를 돌려줌)
+// clearRIB : 보기 모두의 라우팅 테이블과 수를 버림 (세션 하나 = 보기 모두. 메모리를 돌려줌)
 func (p *peer) clearRIB() {
 	p.views = [nViews]*ribView{}
 	p.ribWait, p.ribLog = false, nil
@@ -326,7 +330,7 @@ func (p *peer) markDown(t time.Time, why string) {
 	p.addEvent(t, "down : "+why)
 }
 
-// attrOf : UPDATE 속성 -> 경로표 속성 (next hop 고르는 법은 addRow 와 같음)
+// attrOf : UPDATE 속성 -> 라우팅 테이블 속성 (next hop 고르는 법은 addRow 와 같음)
 func attrOf(a *attrs, v4 bool) pathAttr {
 	nh := a.mpNextHop
 	if v4 && a.nextHop != "" {
@@ -339,23 +343,23 @@ func attrOf(a *attrs, v4 bool) pathAttr {
 	}
 }
 
-// count : 보기 v 의 수와 시각 (경로표와 상관없이 늘 셈)
+// count : 보기 v 의 수와 시각 (라우팅 테이블과 상관없이 늘 셈)
 func (rv *ribView) count(u *update, now time.Time) {
 	rv.adds += uint64(len(u.v4Add) + len(u.v6Add))
 	rv.dels += uint64(len(u.v4Del) + len(u.v6Del))
 	rv.lastUpdate = now
 }
 
-// countOnly : 경로표 없이 (-rib=false) 수와 시각만
+// countOnly : 라우팅 테이블 없이 (-rib=false) 수와 시각만
 func (p *peer) countOnly(v int, u *update, now time.Time) {
 	rv := p.viewFor(v)
 	rv.count(u, now)
-	if len(u.v4Add)+len(u.v6Add) > 0 { // 경로표가 없어 새 프리픽스인지 모름 : add 를 받은 때로
+	if len(u.v4Add)+len(u.v6Add) > 0 { // 라우팅 테이블이 없어 새 프리픽스인지 모름 : add 를 받은 때로
 		rv.grewAt = uint32(now.Unix())
 	}
 }
 
-// apply : UPDATE 하나를 보기 v 의 경로표에 (on = 경로표를 드는 종류, -rib)
+// apply : UPDATE 하나를 보기 v 의 라우팅 테이블에 (on = 라우팅 테이블을 드는 종류, -rib)
 func (p *peer) apply(v int, u *update, now time.Time, on ribOn) {
 	rv := p.viewFor(v)
 	rv.count(u, now)
@@ -367,13 +371,13 @@ func (p *peer) apply(v int, u *update, now time.Time, on ribOn) {
 	rv.ribApply(u, t, p.addPathV4, p.addPathV6, on, p.addPathFams)
 }
 
-// ribApply : UPDATE 하나를 경로표에 (t = unix 초). ap4 / ap6 = 이 세션이 그 종류에 Add-Path 를 협상함
+// ribApply : UPDATE 하나를 라우팅 테이블에 (t = unix 초). ap4 / ap6 = 이 세션이 그 종류에 Add-Path 를 협상함
 // (그러면 NLRI 마다 path ID 가 있고, 넣기 / 빼기가 그 path ID 의 경로만 : ribtable.go)
 func (rv *ribView) ribApply(u *update, t uint32, ap4, ap6 bool, on ribOn, apFams []family) {
 	if u.fams != nil && len(on.fam) > 0 { // unicast 밖 종류 (famrib.go)
 		rv.applyFams(u, t, on.fam, apFams)
 	}
-	if (!on.v4 && len(u.v4Add) > 0) || (!on.v6 && len(u.v6Add) > 0) { // 경로표가 꺼진 종류 : 새 경로인지 몰라 add 를 받은 때로 (settled)
+	if (!on.v4 && len(u.v4Add) > 0) || (!on.v6 && len(u.v6Add) > 0) { // 라우팅 테이블이 꺼진 종류 : 새 경로인지 몰라 add 를 받은 때로 (settled)
 		rv.grewAt = t
 	}
 	n := rv.rib4.paths() + rv.rib6.paths()
@@ -422,10 +426,10 @@ func (rv *ribView) ribApply(u *update, t uint32, ap4, ap6 bool, on ribOn, apFams
 	}
 }
 
-// ribLoaded : 뒤에서 읽은 경로표 (보기마다, nil = 그 보기 없음) 를 넣고 미뤄 둔 UPDATE 를 차례로 (r.mu 쓰기 잠금 안에서).
-// 수 / 시각 (adds, eor ...) 은 상태 파일의 peer 부분에서 이미 옴 : 경로표만 넣음.
-// 기다림이 이미 끝났으면 (그 사이 경로표를 비움) 읽은 것은 버리고 false
-// on = 이 판의 -rib : 옛 판이 넘긴 경로표 중 꺼진 종류는 버림
+// ribLoaded : 뒤에서 읽은 라우팅 테이블 (보기마다, nil = 그 보기 없음) 를 넣고 미뤄 둔 UPDATE 를 차례로 (r.mu 쓰기 잠금 안에서).
+// 수 / 시각 (adds, eor ...) 은 상태 파일의 peer 부분에서 이미 옴 : 라우팅 테이블만 넣음.
+// 기다림이 이미 끝났으면 (그 사이 라우팅 테이블을 비움) 읽은 것은 버리고 false
+// on = 이 판의 -rib : 옛 판이 넘긴 라우팅 테이블 중 꺼진 종류는 버림
 func (p *peer) ribLoaded(tabs [nViews]*ribView, on ribOn) bool {
 	if !p.ribWait {
 		return false

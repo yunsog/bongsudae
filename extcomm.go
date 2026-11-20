@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 // Extended community 글자 (RFC 4360, 5668, 7153, IANA "BGP Extended Communities" 등록부)
 //
 // 8 바이트마다 : 종류 1 + 하위 종류 1 + 값 6. 여럿이면 공백 하나로 이음.

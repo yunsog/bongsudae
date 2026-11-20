@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 // 무중단 판 올리기 시험 (handover.go). exec 를 거치는 시험은 시험 포트에서 (docs/release.md, tools/bmp_replay)
 package main
 
@@ -33,14 +35,14 @@ func TestHandoverFields(t *testing.T) {
 		"lastMsg", "connects", "typeCount", "errors", "noOpen", "lastTerm", "lastReset", "lastResetWhy"},
 		[]string{"mu", "byID", "stat", "sink", "enc"}) // byID = 찾을 때 다시 채움, stat = 판 올리기 직전에 기록하고 0, sink / enc = 줄 버퍼
 	check(peer{}, []string{"key", "ip", "ipStr", "rd", "typ", "flags", "as", "bgpID", "bgpIDRaw", "bmpStats", "bmpStatsAt", "up", "gotUp",
-		"noOpen", "since", "localIP", "localPort", "rmtPort", "holdSent", "holdRecv", "sentCaps", "recvCaps", "addPathV4", "addPathV6",
+		"noOpen", "since", "localIP", "localPort", "rmtPort", "holdSent", "holdRecv", "sentCaps", "recvCaps", "infoData", "tableName", "addPathV4", "addPathV6",
 		"famV4", "famV6", "fams", "addPathFams", "downReason", "hist", "views"},
-		[]string{"ribWait", "ribLog"}) // 새 판에서만 쓰는 것 (0.3.0 : 보기마다 수 / 경로표 = views, 상태 형식 2 가 넘김)
+		[]string{"ribWait", "ribLog"}) // 새 판에서만 쓰는 것 (0.3.0 : 보기마다 수 / 라우팅 테이블 = views, 상태 형식 2 가 넘김)
 }
 
 // testRouterState : 칸마다 0 이 아닌 값 (빠뜨리면 왕복 비교에서 보임)
 func testCollector() *collector {
-	c := newCollector("x")
+	c := ribCollector("x")
 	now := time.Unix(1793160000, 123000).UTC()
 	r := c.routerFor("192.0.2.1", "")
 	r.routerSeq, r.peerSeq, r.terminated, r.connGen = 3, 4, true, 7
@@ -68,7 +70,7 @@ func testCollector() *collector {
 	return c
 }
 
-// 상태 파일 왕복 : 라우터 / peer / seq / 경로표가 같음, 경로표를 읽는 동안 온 UPDATE 는 읽은 뒤 적용
+// 상태 파일 왕복 : 라우터 / peer / seq / 라우팅 테이블이 같음, 라우팅 테이블을 읽는 동안 온 UPDATE 는 읽은 뒤 적용
 func TestHandoverStateRoundTrip(t *testing.T) {
 	c := testCollector()
 	old := c.routers["192.0.2.1"]
@@ -87,7 +89,7 @@ func TestHandoverStateRoundTrip(t *testing.T) {
 	if got.Conns[0].Gen != 7 || !bytes.Equal(got.Conns[0].Pending, []byte{3, 0, 0}) || got.Seq != 12345 {
 		t.Fatalf("state %+v", got)
 	}
-	c2 := newCollector("x")
+	c2 := ribCollector("x")
 	got.restore(c2)
 	r2 := c2.routers["192.0.2.1"]
 	if !reflect.DeepEqual(saveRouter(r2), saveRouter(old)) || c2.seq.Load() != 12345 {
@@ -99,7 +101,7 @@ func TestHandoverStateRoundTrip(t *testing.T) {
 			t.Fatalf("peer %d\n got  %+v\n want %+v", i, savePeer(p, stateVersion), savePeer(wantPeers[i], stateVersion))
 		}
 	}
-	// 경로표를 읽기 전에 온 UPDATE : 하나는 더하고 하나는 지움 -> 읽은 뒤에 적용되어야 함
+	// 라우팅 테이블을 읽기 전에 온 UPDATE : 하나는 더하고 하나는 지움 -> 읽은 뒤에 적용되어야 함
 	p0 := ps[0]
 	u := &update{attrs: attrs{asPath: " 64511", originAS: 64511, origin: "igp"}}
 	u.v4Add = []prefix{{addr: netip.MustParseAddr("198.51.100.0"), length: 24}}
@@ -108,7 +110,7 @@ func TestHandoverStateRoundTrip(t *testing.T) {
 	if inPre(p0).rib4.size() != 0 || len(p0.ribLog) != 1 {
 		t.Fatalf("while loading : rib4 %d log %d", inPre(p0).rib4.size(), len(p0.ribLog))
 	}
-	// 두 번째 peer 는 그 사이 새 세션 (Peer Up) : 읽은 경로표는 버려야 함
+	// 두 번째 peer 는 그 사이 새 세션 (Peer Up) : 읽은 라우팅 테이블은 버려야 함
 	ps[1].clearRIB()
 	got.loadRIBs(c2)
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
@@ -125,7 +127,7 @@ func TestHandoverStateRoundTrip(t *testing.T) {
 	path3 := filepath.Join(t.TempDir(), "y.state")
 	writeHandover(path3, &handoverState{Version: stateVersion}, c3)
 	h3, _ := readHandover(path3)
-	c4 := newCollector("x")
+	c4 := ribCollector("x")
 	h3.restore(c4)
 	h3.loadRIBs(c4)
 	if d, n := ribDigest(allPeers(c4)); d != wantDigest || n != wantN {

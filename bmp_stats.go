@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 // bmp_stats.go : BMP Statistics Report (종류 1, RFC 7854 4.8) -> peer 상세 API 의 bmp_stats (0.2.0)
 //
 // 라우터가 peer 마다 주기적으로 보내는 수 (거부한 프리픽스, 중복, 경로 수 등). Kafka 로는 내지 않음 (읽는 소비자 없음).

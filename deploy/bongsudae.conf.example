@@ -31,8 +31,9 @@ allow  = 0.0.0.0/0, ::/0             # routers allowed to connect : addresses / 
 raw    = true                        # forward every received BMP message to openbmp.bmp_raw (reload)  option -raw
 chash  =                             # C_HASH_ID in message headers, 32 hex digits (restart)        option -chash
                                      #   empty = md5(host name). Also used in router hashes : keep it stable
-rib    = ipv4-unicast, ipv6-unicast  # address families with route tables (restart) : list, all, none (forward only)  option -rib
-                                     #   false = forward only : much less memory, no route counts / prefix lookup API
+rib    = ipv4-unicast, ipv6-unicast  # address families with routing tables (restart) : list, all, none (forward only)  option -rib
+                                     #   default (no line) = none : forward only, much less memory, no route counts / prefix lookup API.
+                                     #   e.g. ipv4-unicast, ipv6-unicast, vpnv4, vpnv6, ipv4-flowspec, ipv6-flowspec
 
 
 [kafka]

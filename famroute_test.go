@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 package main
 
 import (
@@ -24,7 +26,7 @@ func famRows(t *testing.T, m outMsg) [][]string {
 }
 
 func famTestPeer() (*collector, *router, *rowPeer) {
-	c := newCollector("x")
+	c := ribCollector("x")
 	r := c.routerFor("192.0.2.1", "")
 	rp := &rowPeer{routerHash: "r", routerIP: "192.0.2.1", peerHash: "p", peerIP: "198.51.100.1", peerAS: 64496,
 		ts: "2026-11-03 00:00:00.000000", prePolicy: true, adjRibIn: true}
@@ -151,4 +153,12 @@ func TestFamilyFileMode(t *testing.T) {
 	if _, err := os.Stat(out + "." + kindMulticast + ".dump"); err == nil {
 		t.Fatal("unused family topic file must not be created")
 	}
+}
+
+// ribCollector : 시험용 수집기 = IPv4 / IPv6 unicast 라우팅 테이블을 켬 (0.3 까지의 기본. 0.4.0~ 기본은 끔)
+func ribCollector(cHash string) *collector {
+	c := newCollector(cHash)
+	fams, _ := parseRIBFamilies(unicastRIB)
+	c.setRIB(fams)
+	return c
 }

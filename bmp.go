@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 // BMP v3 해석 (RFC 7854, RFC 9069)
 //
 // 메시지 = 공통 머리 (6 바이트) + 몸통.

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 // 프리픽스 찾기 (웹 API) : 하나 (GET) / 여러 개 (POST), origin 필터, total (필터 뒤 limit 전 줄 수)
 //
 //	GET  /api/prefix?p=&match=&limit=&origin_as=&not_origin=&format=text
@@ -302,7 +304,7 @@ func newMoreIndex(qs []findQuery) *moreIndex {
 	return m
 }
 
-// scan : peer 의 경로표를 한 번 훑어, 경로마다 그것을 덮는 질의 프리픽스 (질의에 있는 길이만) 를 찾음.
+// scan : peer 의 라우팅 테이블을 한 번 훑어, 경로마다 그것을 덮는 질의 프리픽스 (질의에 있는 길이만) 를 찾음.
 // 줄 하나를 더할 때마다 fit(1) 로 자리를 확인하고, 자리가 없으면 바로 멈추고 false (= 줄이 너무 많음)
 func (m *moreIndex) scan(r *router, p *peer, view int, res []findResult, fit func(int) bool) bool {
 	if len(m.idx) == 0 {
@@ -586,7 +588,7 @@ type httpError struct {
 
 func (e httpError) Error() string { return e.msg }
 
-// famQuery : 찾기의 family= (0.3.0). 빈칸 / unicast = 0 (unicast 경로표), 경로표가 없는 종류 = 400, 꺼진 종류 = 409
+// famQuery : 찾기의 family= (0.3.0). 빈칸 / unicast = 0 (unicast 라우팅 테이블), 라우팅 테이블이 없는 종류 = 400, 꺼진 종류 = 409
 func (c *collector) famQuery(s string) (family, error) {
 	if s == "" {
 		return 0, nil

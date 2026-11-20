@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 package main
 
 // (11-05) 인증 없는 API 요청으로 서비스가 멈추지 않게 한 것의 시험 :
@@ -20,7 +22,7 @@ import (
 
 // guardCollector : 라우터 하나, peer 둘, peer 마다 /24 1000 개 (1.0.0.0/24 ~ 1.3.231.0/24)
 func guardCollector() *collector {
-	c := newCollector("x")
+	c := ribCollector("x")
 	r := c.routerFor("192.0.2.1", "")
 	a := unique.Make(pathAttr{asPath: " 64500", originAS: 64500})
 	for pi := 0; pi < 2; pi++ {

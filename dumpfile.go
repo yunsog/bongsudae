@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 // 덤프 파일 (tools/kafka_dump 형식) 읽기 / 쓰기
 //
 // 레코드마다 : "partition \t offset \t 시각ms \t key 길이 \t value 길이 \n" + key + value + "\n"

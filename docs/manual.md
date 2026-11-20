@@ -12,7 +12,7 @@ publishes OpenBMP v1.7 format messages to Kafka, and serves routers, peers and t
 | Requirements | Linux, Kafka (tested with Apache Kafka 4.x in KRaft mode), enough memory for the routing table (section 6.2) |
 | Standards | BMP RFC 7854; BGP RFC 4271, 4760 (multiprotocol), 6793 (4-byte AS), 7911 (Add-Path); communities RFC 1997, 4360, 5668, 8092 |
 | Output format | OpenBMP Message Bus API v1.7 (same topics and fields as openbmpd 2.2.3). Where openbmpd differs from the RFCs, Bongsudae follows the RFCs (differences in docs/kafka.md) |
-| Scope | IPv4 / IPv6 unicast, (0.3.0+) labeled unicast, L3VPN, multicast, EVPN, FlowSpec. BGP-LS and other address families are counted and dropped |
+| Scope | IPv4 / IPv6 unicast, (0.3.0+) labeled unicast, L3VPN, multicast, EVPN, FlowSpec. (0.4.0+) BGP-LS, VPLS, MVPN, SR Policy, RT Constraint and every other family (other_family). Routing tables only for unicast / labeled / L3VPN / multicast / FlowSpec |
 
 ---
 
@@ -60,11 +60,13 @@ Example files are in `deploy/` (`bongsudae.conf.example`, `bongsudae.service.exa
 
 ```bash
 # 1) Binary : download bongsudae_<version>_linux_<amd64|arm64>.tar.gz + SHA256SUMS from GitHub Releases (0.3.0+, static)
-tar xzf bongsudae_0.3.0_linux_amd64.tar.gz && sha256sum -c --ignore-missing SHA256SUMS
-cp bongsudae_0.3.0_linux_amd64/bongsudae .
+tar xzf bongsudae_0.4.0_linux_amd64.tar.gz && sha256sum -c --ignore-missing SHA256SUMS
+cp bongsudae_0.4.0_linux_amd64/bongsudae .
 #    or build (Go 1.26 or later; go downloads the one dependency, franz-go, checked by go.sum)
-go install github.com/yunsog/bongsudae@latest      # -> $(go env GOPATH)/bin/bongsudae
-#    or in a clone : go build -o bongsudae . && go test ./...
+CGO_ENABLED=0 go install github.com/yunsog/bongsudae@latest      # -> $(go env GOPATH)/bin/bongsudae
+#    or in a clone : CGO_ENABLED=0 go build -o bongsudae . && go test ./...
+#    (static, recommended : the binary does not use libc, so a libc security update does not
+#     make needrestart restart the collector, which would make every router resend its routes)
 sudo install -m 755 bongsudae /usr/local/bin/bongsudae
 
 # 2) User and working directory
@@ -155,7 +157,7 @@ Options with a "Config key" can also be set in the config file (section 5). "Rel
 | `-partitions` | `8` | `kafka.partitions` | restart | Partitions of topics the collector creates (existing topics are not changed) |
 | `-replication` | `1` | `kafka.replication` | restart | Replication factor of topics the collector creates |
 | `-retention` | `90m` | `kafka.retention` | restart | Retention (retention.ms) of topics the collector creates, at least 1m |
-| `-rib` | `ipv4-unicast,ipv6-unicast` | `bmp.rib` | restart | (0.3.0+: a list of address families) Address families to keep route tables for: `ipv4-unicast,ipv6-unicast,vpnv4 ...`, `all` (every family with route tables: unicast, labeled, vpnv4 / vpnv6, multicast, the four FlowSpec families), `none` (forward only, much less memory). The 0.2 values still work: `true` = ipv4 / ipv6-unicast, `false` = none. Kafka output is the same; families without a table are missing from route counts, lists and lookups (all off: those APIs answer 409; one off: peer warning `route table off for ...`). A family this release does not parse yet is accepted with a log line |
+| `-rib` | `none` (0.4.0+; up to 0.3 `ipv4-unicast,ipv6-unicast`) | `bmp.rib` | restart | (0.3.0+: a list of address families) Address families to keep routing tables for. **From 0.4.0 all are off by default** (unicast too): to use route counts / prefix lists / lookups, turn them on with `bmp.rib` or the option, e.g. `ipv4-unicast,ipv6-unicast,vpnv4,vpnv6,ipv4-flowspec,ipv6-flowspec`, `all` (every family with routing tables: unicast, labeled, vpnv4 / vpnv6, multicast, the four FlowSpec families), `none` (forward only, much less memory). The 0.2 values still work: `true` = ipv4 / ipv6-unicast, `false` = none. Kafka output is the same; families without a table are missing from route counts, lists and lookups (all off: those APIs answer 409; one off: peer warning `route table off for ...`). A family this release does not parse yet is accepted with a log line |
 | `-key-buckets` | `0` | `kafka.key_buckets` | restart | Split the unicast_prefix Kafka key (0 = one key per peer, N = N buckets by prefix, key `<peer hash>.<bucket>`, 0 to 64). See docs/kafka.md section 1 |
 | `-format` | `openbmp` | `kafka.format` | restart | Message format of unicast_prefix / router / peer: `openbmp` (v1.7, tab separated) or `json` (one JSON object per line). bmp_raw is unchanged. kafka.md 2.1 |
 | `-prefix` | `openbmp.parsed` | `kafka.prefix` | restart | Output topic prefix (`<prefix>.unicast_prefix / .router / .peer`). For tests use `openbmp.test` |
@@ -254,11 +256,12 @@ allow  =                             # empty = everyone (firewall only)
 - No del rows are generated on Peer Down (same as openbmpd). When a router disconnects only a router term message is sent; consumers should treat it as "all peers of that router are down".
 - Routing table: live prefixes per peer (the same add several times = 1, del removes). Peer down, a new Peer Up, or router disconnect resets it to 0. Path attributes are shared between routes.
 - Views (0.3.0+): when a router sends the same neighbor in several views (Adj-RIB-In pre / post-policy, Adj-RIB-Out pre / post, Loc-RIB; L / O flags and Peer Type 3 of the per-peer header),
-  each view has its own route table. The API shows the peer's main view (normally in-pre) and takes `view=`. Peer Down / a new Peer Up clears all views. Kafka rows are unchanged (isPrePolicy / isAdjRibIn).
+  each view has its own routing table. The API shows the peer's main view (normally in-pre) and takes `view=`. Peer Down / a new Peer Up clears all views (0.4.0+ exception: a Peer Up of a family not yet seen on an up Loc-RIB peer = RFC 9069 6.1.1 emulated peer, merged without clearing). Kafka rows are unchanged (isPrePolicy / isAdjRibIn).
 - Address families (0.3.0+): MP_REACH / MP_UNREACH are parsed per AFI / SAFI by a registered parser (family.go): ipv4 / ipv6-unicast and **labeled unicast, L3VPN (VPNv4 / VPNv6), multicast, EVPN, FlowSpec (IPv4 / IPv6 / VPN)**
   (famroute.go / evpn.go / flowspec.go: Kafka topics `labeled_unicast_prefix`, `l3vpn`, `multicast_prefix`, `evpn`, `flowspec`, created when the first route arrives; row formats in kafka.md 3.2 - 3.4; flowspec is Bongsudae's own 43-field format).
-  Route tables for these families (famrib.go) are kept only for families listed in `bmp.rib` (off by default): L3VPN routes are keyed by RD + prefix, labels are kept as a route attribute, FlowSpec rules are keyed by (RD, rule) and looked up by destination prefix (no route tables for EVPN). API: peer `family_routes`, list / lookup `family=`. Other families are counted per family and dropped
-  (`other_families:` in the stat line, /api/stats, /metrics `bongsudae_other_family_total`). The peer detail `families` lists the families announced in both OPENs.
+  Routing tables for these families (famrib.go) are kept only for families listed in `bmp.rib` (off by default): L3VPN routes are keyed by RD + prefix, labels are kept as a route attribute, FlowSpec rules are keyed by (RD, rule) and looked up by destination prefix (no routing tables for EVPN). API: peer `family_routes`, list / lookup `family=`.
+  (0.4.0+) All other families go to Kafka too (no routing tables, common layout in xroute.go): BGP-LS (`ls_node` / `ls_link` / `ls_prefix`, OpenBMP schema), VPLS (`l2vpn_vpls`), MVPN (`mvpn`), SR Policy (`sr_policy`), RT Constraint (`rt_constraint`), everything else (`other_family` = NLRI hex + decodable fields): kafka.md 3.5 - 3.11.
+  Routes of unknown shape go to other_family as hex and are counted per family (`other_families:` in the stat line, /api/stats, /metrics `bongsudae_other_family_total`; up to 0.3 they were dropped). The peer detail `families` lists the families announced in both OPENs.
 - Add-Path (0.3.0+, RFC 7911): for sessions that negotiated Add-Path (OPEN messages in the Peer Up), each path ID of a prefix is kept separately (a route with the same ID replaces only that path; a withdrawal removes only that ID).
   API rows carry `path_id`, peers `paths_v4 / v6`. Other sessions keep the same tables and memory. Kafka rows are unchanged (path_id field since 0.1).
 - Done yet? `synced` = End-of-RIB received. `settled` = synced, or up for 5 minutes with no new prefix for 5 minutes
@@ -335,20 +338,20 @@ Like nginx's binary upgrade: **the same pid** execs the new file, so for systemd
 | 1 | Checks the new binary: picks the newest state format it reads (`-handover-formats`; a 0.2 binary has only `-handover-check` = format 1) that this process can write, and `-t` (accepts the current config). Stops here if not | |
 | 2 | Pause: stops accepting and stops reading from every router at a message boundary (bytes of a half-read message are handed over). Routers wait on TCP | |
 | 3 | Flushes everything pending to Kafka | |
-| 4 | Writes the state file `<lock file without .lock>.state` (e.g. `run/bongsudae.state`): routers / peers (Add-Path, negotiated families, EoR, history ...), row sequence number, connections (fd, number, pending bytes), 1-minute statistics, route tables | |
+| 4 | Writes the state file `<lock file without .lock>.state` (e.g. `run/bongsudae.state`): routers / peers (Add-Path, negotiated families, EoR, history ...), row sequence number, connections (fd, number, pending bytes), 1-minute statistics, routing tables | |
 | 5 | exec (same pid, same options + `-resume <state file>`) | Reads the config and rules files again, connects to Kafka, restores routers / peers |
 | 6 | | Takes the connections over and continues reading from the pending bytes = **end of the pause** |
-| 7 | | Loads the route tables in the background. UPDATEs arriving meanwhile are queued per peer and applied after its table is loaded. The state file is removed at the end |
+| 7 | | Loads the routing tables in the background. UPDATEs arriving meanwhile are queued per peer and applied after its table is loaded. The state file is removed at the end |
 
-- Pause: about 0.4 s with 8 million routes (test); 5.5 to 6.4 s with a full table of 77 million routes (2.4 GB state file). Mostly step 4 (about 4 s writing the route tables) and the start of the new process (about 2 s, Kafka connection etc.)
-- Kafka output does not depend on the route tables, so it does not wait for step 7. During step 7 (about 9 s at full size) route counts and prefix lookups are incomplete (`handover.rib_loading` in `/api/stats`)
+- Pause: about 0.4 s with 8 million routes (test); 5.5 to 6.4 s with a full table of 77 million routes (2.4 GB state file). Mostly step 4 (about 4 s writing the routing tables) and the start of the new process (about 2 s, Kafka connection etc.)
+- Kafka output does not depend on the routing tables, so it does not wait for step 7. During step 7 (about 9 s at full size) route counts and prefix lookups are incomplete (`handover.rib_loading` in `/api/stats`)
 - Row sequence numbers and peer / router message numbers continue. No extra router / peer messages are sent (consumers see nothing)
 - On failure in steps 1 to 5 (including a failed exec) the old process simply continues reading the paused connections (log `handover: aborted ...`, `handover.last_error` in `/api/stats`).
   If the new process cannot read the state after exec, it exits and systemd starts it again: the sessions drop and routers reconnect (the same as a restart, never worse)
 - Configuration: the new process reads the config file from scratch, so "restart" keys change too. Exception: `bmp.listen` and `http.listen` keep the inherited sockets (a restart is needed; one log line).
   Do not change `kafka.prefix`, `kafka.key_buckets` or `bmp.chash` together with an upgrade (topics / keys would change for consumers mid-stream)
-- The process handing over must already have this feature: upgrading from 0.1 to 0.2.0 is the last ordinary restart. Refused while the route tables of the previous handover are still loading (about a minute)
-- State formats (0.3.0+): 1 = 0.2 (one route table per peer), 2 = 0.3 (route tables and counters per view). 0.3 reads both and writes the newest one the new binary reads,
+- The process handing over must already have this feature: upgrading from 0.1 to 0.2.0 is the last ordinary restart. Refused while the routing tables of the previous handover are still loading (about a minute)
+- State formats (0.3.0+): 1 = 0.2 (one routing table per peer), 2 = 0.3 (routing tables and counters per view). 0.3 reads both and writes the newest one the new binary reads,
   so 0.2 -> 0.3 and a rollback 0.3 -> 0.2 are both hitless (the rollback writes format 1; it is refused if a peer has two or more views, which format 1 cannot hold).
 - Tested with 25 simulated routers sending continuously while the collector was upgraded every 6 s (31 times, alternating old and new releases): the Kafka output matched a single uninterrupted run row by row
 
@@ -374,7 +377,7 @@ Like nginx's binary upgrade: **the same pid** execs the new file, so for systemd
 - `http.listen`. Clients outside `http.allow` get 403. **In production, restrict `http.allow` to the hosts that call the API**
   (empty = everyone = only the firewall protects it).
 - Protection against unauthenticated requests stopping the collector:
-  - Concurrency: 4 requests that scan route tables (`.../prefixes`, `.../prefix`) and 16 others. No slot within 5 seconds = 503.
+  - Concurrency: 4 requests that scan routing tables (`.../prefixes`, `.../prefix`) and 16 others. No slot within 5 seconds = 503.
   - The request (headers and body) must arrive within 30 seconds; a client that reads nothing of the response for 1 minute
     is disconnected (downloads that keep reading finish).
   - A prefix search holds at most 2,000,000 rows (limit given: trimmed as it goes; 413 beyond, e.g. `0.0.0.0/0` more without limit). Identical queries are searched once.
@@ -386,6 +389,7 @@ Like nginx's binary upgrade: **the same pid** execs the new file, so for systemd
 |---|---|
 | Health (per-minute stats for 60 minutes, release / version, memory, Kafka) | `GET /api/stats` |
 | Prometheus | `GET /metrics` (the same numbers in the Prometheus text format, api.md section 2) |
+| Grafana dashboard (0.4.0~) | import `deploy/grafana/bongsudae.json` (Prometheus must scrape /metrics, api.md section 2) |
 | Routers / peers | `GET /api/routers`, `/api/routers/{ip}`, `/api/peers`, `/api/routers/{ip}/peers/{peer}` |
 | Route lists | `GET /api/routers/{ip}/peers/{peer}/prefixes`, `/api/routers/{ip}/prefixes` (`?format=text`, `?distinct=1`) |
 | Prefix / address lookup | `GET /api/prefix?p=...&match=exact\|longest\|covering\|more`, `/api/routers/{ip}/prefix` |
@@ -433,7 +437,7 @@ The table lists the fixed parts of each line.
 | connection | `conn 203.0.113.5: initiation, but already 2000 routers connected (maxRouters), drop` | Router connection limit |
 | connection | `conn ...: first message type N (not initiation), drop`, `too many connections, drop ...` | Closed by protection (6.1) |
 | processing | `router ...: peer_up ... without OPEN (RFC 7854 violation) ...` | Router violates the standard; the message is still processed |
-| every minute | `stat routers=3 route_mon=47346 errors=0 add=63722 del=11101 msgs=47346 ... raw=47344 kafka_fail=0 topics: unicast_prefix=47343/74820` | See the table below. (0.3.0+) `family_rows=N` when address family rows were produced; `other_families: bgp-ls=3,rt-constraint=1` at the end when families were dropped |
+| every minute | `stat routers=3 route_mon=47346 errors=0 add=63722 del=11101 msgs=47346 ... raw=47344 kafka_fail=0 topics: unicast_prefix=47343/74820` | See the table below. (0.3.0+) `family_rows=N` when address family rows were produced; `other_families: 99/9=3,bgp-ls=1` at the end for routes of unknown shape (0.4.0+ sent to other_family as hex; dropped in 0.3) |
 | family topic | `kafka topic openbmp.parsed.l3vpn : first l3vpn route, topic ready` | (0.3.0+) the first route of that family created its topic (once per process) |
 | Kafka | `... : N times (last minute)` | Kafka error summary: N times in the last minute (one line per error type) |
 | Kafka | `kafka produce failing for more than 2m0s : exiting (systemd restarts)` | No successful produce for 2 minutes, exiting (6.3) |
@@ -448,7 +452,7 @@ The table lists the fixed parts of each line.
 | upgrade | `handover: start (SIGUSR2), checking /var/lib/bongsudae/bongsudae` | Old process: start (6.7) |
 | upgrade | `handover: paused 25 connections in 4ms, kafka flushed in 1ms, state run/bongsudae.state (2434 MB, 76937952 routes) written in ...: exec ...` | Old process: paused, flushed, state written, now exec |
 | upgrade | `start bongsudae 0.2.1 (...) (handover) ...` then `handover: resumed from 0.2.0 ... : 25 connections, 25 routers, 1331 peers, routers paused ...` | New process: took over, how long routers were paused |
-| upgrade | `handover: route tables loaded : N routes in ...` | New process: route tables loaded |
+| upgrade | `handover: route tables loaded : N routes in ...` | New process: routing tables loaded |
 | upgrade | `handover: aborted, old process keeps running : ...` | Gave up, the old process keeps running. Reason: new binary check, connections that did not pause, Kafka, state file, exec |
 | upgrade | `handover: bmp.listen ... ignored, keeping the inherited socket (needs a restart)` | The listen address in the config changed: only a restart changes it |
 

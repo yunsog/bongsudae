@@ -1,8 +1,11 @@
+// SPDX-License-Identifier: Apache-2.0
+
 // 시험 : go test .
 // 표본 (data/, 10-28) 에서 꺼낸 실제 UPDATE 바이트로 openbmpd 출력과 같은지 확인
 package main
 
 import (
+	"bytes"
 	"encoding/hex"
 	"fmt"
 	"net"
@@ -94,7 +97,7 @@ func TestASSet(t *testing.T) {
 // 깨진 입력 : 오류로 돌아와야 함 (panic 아님)
 func TestBroken(t *testing.T) {
 	for _, s := range []string{"", "03", "0300000006", "0400000006", "03ffffffff00", "0300000030" + strings.Repeat("00", 43)} {
-		c := newCollector("x")
+		c := ribCollector("x")
 		b, _ := hex.DecodeString(s)
 		c.safeProcess(c.routerFor("1.2.3.4", ""), b, testNow)
 	}
@@ -102,7 +105,7 @@ func TestBroken(t *testing.T) {
 
 // OPEN 없는 Peer Up (192.0.2.100 -> peer 198.51.100.103, 10-29 tcpdump) : 오류가 아니라 빈 능력의 peer up 하나
 func TestPeerUpNoOpen(t *testing.T) {
-	c := newCollector("x")
+	c := ribCollector("x")
 	b := mustHex(t, "03000000440300000000000000000000000000000000000000000000c63364670000fbf0c63364676ae222c300051812000000000000000000000000c0000264e2e800b3")
 	r := c.routerFor("192.0.2.100", "")
 	out := c.safeProcess(r, b, testNow)
@@ -117,7 +120,7 @@ func TestPeerUpNoOpen(t *testing.T) {
 
 // Peer Down 이유 2 (NOTIFICATION 없이 라우터가 닫음, FSM event 2 바이트) : openbmpd 와 같은 코드 0 / 0 과 글자
 func TestPeerDownLocal(t *testing.T) {
-	c := newCollector("x")
+	c := ribCollector("x")
 	b := mustHex(t, "0300000033020000000000000000000000000000000000000000000001020305"+"00003b418efb31080000000000000000"+"020007")
 	out := c.safeProcess(c.routerFor("1.2.3.4", ""), b, testNow)
 	if len(out) != 1 {
@@ -160,7 +163,7 @@ func TestRIBCount(t *testing.T) {
 		t.Fatalf("longest %v", m)
 	}
 	q, _, _ = parseQuery("1.0.0.0/16")
-	if ms, _ := newCollector("x").findMany([]routerPeer{{r, p}}, []findQuery{{p: q, how: "more"}}, 0, nil, -1, 0); ms[0].total != 2 {
+	if ms, _ := ribCollector("x").findMany([]routerPeer{{r, p}}, []findQuery{{p: q, how: "more"}}, 0, nil, -1, 0); ms[0].total != 2 {
 		t.Fatalf("more %v", ms[0].rows)
 	}
 	if m := match(r, p, -1, netip.MustParsePrefix("1.0.1.0/24"), "covering"); len(m) != 2 {
@@ -186,7 +189,7 @@ func TestKeyBuckets(t *testing.T) {
 	u := &update{attrs: attrs{asPath: " 64500", nextHop: "192.0.2.1"}, v4Add: adds, v4Del: dels[:1], v6Del: dels[1:]}
 	rp := &rowPeer{routerHash: "r", routerIP: "192.0.2.1", peerHash: "p", peerIP: "198.51.100.1", ts: "2026-11-01 00:00:00.000000", prePolicy: true, adjRibIn: true}
 	rows := func(n int) (map[string]string, []outMsg) { // 줄 -> key
-		c := newCollector("x")
+		c := ribCollector("x")
 		c.keyBuckets = n
 		out := c.updateMsgs(&router{}, rp, u)
 		m := map[string]string{}
@@ -293,7 +296,7 @@ func TestConnTableReplace(t *testing.T) {
 
 // BMP Stats Report (0.2.0) : 아는 peer 에만, 32 / 64 비트 / 주소 종류마다
 func TestStatsReport(t *testing.T) {
-	c := newCollector("x")
+	c := ribCollector("x")
 	r := c.lockRouter("192.0.2.1", "")
 	defer r.mu.Unlock()
 	h := fzPeer(0, 0, false)
@@ -390,5 +393,98 @@ func TestRawValue(t *testing.T) {
 		if string(got) != want || string(full[h.room:]) != string(msg) {
 			t.Fatalf("n %d : %q", n, got[:60])
 		}
+	}
+}
+
+// (0.4.0) Peer Up 정보 TLV : 0 = info_data (16 번 칸), 3 = table_name (30 번 칸, RFC 9069 Loc-RIB).
+// down 줄에도 그 세션의 표 이름, TLV 없는 다음 Peer Up 은 빈칸, 무중단 넘기기 (savePeer / load) 에도 남음
+func TestPeerUpInfoTLV(t *testing.T) {
+	tlv := func(typ uint16, v string) []byte {
+		return append([]byte{byte(typ >> 8), byte(typ), byte(len(v) >> 8), byte(len(v))}, v...)
+	}
+	peerUpMsg := func(info []byte) []byte {
+		b := append(fzPeer(peerTypeLocRIB, 0, false), make([]byte, 20)...) // 로컬 주소 16 + 포트 2 + 2
+		b = append(append(b, fzOpen()...), fzOpen()...)
+		return fzBMP(3, append(b, info...))
+	}
+	fields := func(m outMsg) []string {
+		return strings.Split(strings.TrimSuffix(strings.SplitN(string(m.value), "\n\n", 2)[1], "\n"), "\t")
+	}
+	c := ribCollector("x")
+	r := c.routerFor("192.0.2.1", "")
+
+	info := append(append(tlv(0, "core\tview"), tlv(3, "global")...), tlv(9, "unknown")...)
+	out := c.safeProcess(r, peerUpMsg(info), testNow)
+	if len(out) != 1 || r.stat.errors != 0 {
+		t.Fatalf("up : out %d errors %d", len(out), r.stat.errors)
+	}
+	f := fields(out[0])
+	if len(f) != 31 || f[0] != "up" || f[16] != "core view" || f[28] != "1" || f[30] != "global" {
+		t.Fatalf("up fields %q", f)
+	}
+	var p *peer
+	for _, q := range r.peers {
+		p = q
+	}
+	if p == nil || p.tableName != "global" || p.infoData != "core view" {
+		t.Fatalf("peer %+v", p)
+	}
+	if s := savePeer(p, 2); s.load(2).tableName != "global" || s.load(2).infoData != "core view" {
+		t.Fatal("handover state lost table_name / info_data")
+	}
+
+	// Peer Down (이유 4 : NOTIFICATION 없음) : 표 이름은 남고 info_data 는 up 줄에만
+	down := fzBMP(2, append(fzPeer(peerTypeLocRIB, 0, false), 4))
+	f = fields(c.safeProcess(r, down, testNow)[0])
+	if f[0] != "down" || f[16] != "" || f[30] != "global" {
+		t.Fatalf("down fields %q", f)
+	}
+
+	// 정보 TLV 없는 다음 Peer Up : 빈칸으로
+	f = fields(c.safeProcess(r, peerUpMsg(nil), testNow)[0])
+	if f[0] != "up" || f[16] != "" || f[30] != "" || p.tableName != "" {
+		t.Fatalf("up without TLV fields %q", f)
+	}
+}
+
+// (0.4.0) RFC 9069 6.1.1 : 같은 Loc-RIB 를 주소 종류마다 다른 가상 peer 로 (Junos inet.0 / inet6.0).
+// IPv4 Peer Up -> IPv4 경로 -> IPv6 Peer Up 이 와도 IPv4 라우팅 테이블이 남고 종류가 합쳐짐. 같은 종류의 Peer Up 은 새 세션 (비움)
+func TestLocRIBPerFamilyPeerUp(t *testing.T) {
+	open := func(afi byte) []byte { // 4 바이트 AS + MP 하나
+		caps := []byte{65, 4, 0, 0, 0xfb, 0xf4, 1, 4, 0, afi, 0, 1}
+		opt := append([]byte{2, byte(len(caps))}, caps...)
+		body := append([]byte{4, 0x5b, 0xa0, 0, 180, 198, 51, 100, 1, byte(len(opt))}, opt...)
+		m := append(bytes.Repeat([]byte{0xff}, 16), 0, byte(19+len(body)), 1)
+		return append(m, body...)
+	}
+	up := func(afi byte, name string) []byte {
+		b := append(fzPeer(peerTypeLocRIB, 0, false), make([]byte, 20)...)
+		b = append(append(b, open(afi)...), open(afi)...)
+		return fzBMP(3, append(b, append([]byte{0, 0, 0, byte(len(name))}, name...)...))
+	}
+	fields := func(m outMsg) []string {
+		return strings.Split(strings.TrimSuffix(strings.SplitN(string(m.value), "\n\n", 2)[1], "\n"), "\t")
+	}
+	upd4 := mustHex(t, "ffffffffffffffffffffffffffffffff0052020000003b900e000d00010104c000021700188289634001010040020602010000407d800404000003e840050400000064c0080cfbf4006efbf40c80fbf42328")
+	c := ribCollector("x")
+	r := c.routerFor("192.0.2.1", "")
+	c.safeProcess(r, up(1, "inet.0"), testNow)
+	c.safeProcess(r, fzBMP(0, append(fzPeer(peerTypeLocRIB, 0, false), upd4...)), testNow)
+	f := fields(c.safeProcess(r, up(2, "inet6.0"), testNow)[0])
+	if len(r.peers) != 1 || r.stat.errors != 0 {
+		t.Fatalf("peers %d errors %d", len(r.peers), r.stat.errors)
+	}
+	var p *peer
+	for _, q := range r.peers {
+		p = q
+	}
+	n4, _ := p.view(-1).routes()
+	if n4 != 1 || !p.famV4 || !p.famV6 || len(p.fams) != 2 || p.infoData != "inet.0 inet6.0" || f[16] != "inet6.0" {
+		t.Fatalf("after inet6.0 Peer Up : v4 routes %d famV4 %v famV6 %v fams %v info %q line %q", n4, p.famV4, p.famV6, p.fams, p.infoData, f[16])
+	}
+	// 같은 종류 (IPv4) 의 Peer Up 다시 = 새 세션 : 비우고 처음부터
+	c.safeProcess(r, up(1, "inet.0"), testNow)
+	if n4, _ = p.view(-1).routes(); n4 != 0 || p.famV6 || p.infoData != "inet.0" {
+		t.Fatalf("after second inet.0 Peer Up : v4 routes %d famV6 %v info %q", n4, p.famV6, p.infoData)
 	}
 }

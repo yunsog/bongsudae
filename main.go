@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 // bongsudae : openbmpd 를 대신하는 BMP 수집기
 //
 // 입력 (-input) :
@@ -5,7 +7,7 @@
 //	tcp   : 라우터에서 BMP 를 직접 받음 (-listen, -allow) = 운영
 //	kafka : openbmp.bmp_raw 를 실시간으로 읽음 (-src, -group) = 그림자 실행 (5 단계)
 //	file  : bmp_raw 덤프 파일 (tools/kafka_dump) -> 출력 덤프 파일 (-in, -out) = 시험.
-//	        -http 를 주면 다 처리한 뒤 API 를 열어 두고 기다림 (전체 경로표로 API 시험, 규칙 변경은 꺼짐)
+//	        -http 를 주면 다 처리한 뒤 API 를 열어 두고 기다림 (전체 라우팅 테이블로 API 시험, 규칙 변경은 꺼짐)
 //
 // 출력 : openbmp v1.7 unicast_prefix / router / peer 메시지 -> Kafka 토픽 <-prefix>.<종류>
 //
@@ -56,7 +58,7 @@ var (
 	optRepl      = flag.Int("replication", 1, "replication factor of topics the collector creates")
 	optRetention = flag.Duration("retention", 90*time.Minute, "retention (retention.ms) of topics the collector creates")
 	optFormat    = flag.String("format", "openbmp", "Kafka message format of unicast_prefix / router / peer : openbmp (v1.7, tab separated) or json (one JSON object per line). bmp_raw is unchanged")
-	optRIB       = flag.String("rib", defaultRIB, "address families to keep route tables for (route counts, prefix lookup API) : list such as ipv4-unicast,ipv6-unicast,vpnv4, or all, none (= false : forward only, much less memory), true (= ipv4-unicast,ipv6-unicast)")
+	optRIB       = flag.String("rib", defaultRIB, "address families to keep routing tables for (route counts, prefix lookup API) : list such as ipv4-unicast,ipv6-unicast,vpnv4,ipv4-flowspec, or all, none (default : forward only, much less memory), true (= ipv4-unicast,ipv6-unicast)")
 	optRaw       = flag.Bool("raw", true, "tcp : forward received BMP unchanged to <prefix without .parsed>.bmp_raw (openbmp.parsed -> openbmp.bmp_raw)")
 	optCHash     = flag.String("chash", "", "tcp : C_HASH_ID in message headers (32 hex digits). Empty = md5(host name), like openbmpd without admin_id")
 	optLock      = flag.String("lock", "", "lock file (if another instance holds it : log one line and exit)")
@@ -275,7 +277,7 @@ func run() error {
 	c.json = *optFormat == "json"
 	c.rules, c.prefix, c.tokenPath = rl, *optPrefix, *optToken
 	hs := resumeState
-	if hs != nil { // 판 올리기 : 라우터 / peer 를 되살리고 경로표는 뒤에서
+	if hs != nil { // 판 올리기 : 라우터 / peer 를 되살리고 라우팅 테이블은 뒤에서
 		hs.restore(c)
 		go hs.loadRIBs(c)
 	}
@@ -351,7 +353,7 @@ func addConfHooks(out *producer) {
 	}
 }
 
-// serveFile : file 입력을 다 처리한 뒤 그 경로표로 웹 API 를 열고 kill / Ctrl-C 까지 기다림.
+// serveFile : file 입력을 다 처리한 뒤 그 라우팅 테이블로 웹 API 를 열고 kill / Ctrl-C 까지 기다림.
 // 규칙은 파일에서 읽기만 (key 파일을 비워 변경 API 를 끔 = 시험이 운영 설정을 덮어쓰지 않음)
 func serveFile(c *collector) error {
 	rl, err := newRules(*optRules)
@@ -370,7 +372,7 @@ func serveFile(c *collector) error {
 }
 
 // runFile : bmp_raw 덤프를 읽어 처리하고 결과를 종류별 덤프 (<out>.<종류>.dump) 로 씀. 시각 = 원래 레코드 시각.
-// 돌려주는 collector = 처리가 끝난 경로표 (-http 시험용)
+// 돌려주는 collector = 처리가 끝난 라우팅 테이블 (-http 시험용)
 func runFile(inPath, outPrefix string) (*collector, error) {
 	fi, err := os.Open(inPath)
 	if err != nil {
@@ -384,7 +386,7 @@ func runFile(inPath, outPrefix string) (*collector, error) {
 	pipe := false // 출력이 FIFO (tools/regress) : 입력 레코드마다 바로 내보냄 (모아 두면 두 bongsudae 를 나란히 비교할 때 서로 기다리다 멈춤)
 	offset := map[string]int64{}
 	for _, k := range allKinds {
-		if outPrefix == "none" { // 출력을 버림 (API 시험만 할 때 : 전체 경로표면 출력이 수십 GB)
+		if outPrefix == "none" { // 출력을 버림 (API 시험만 할 때 : 전체 라우팅 테이블이면 출력이 수십 GB)
 			outs[k] = bufio.NewWriter(io.Discard)
 			continue
 		}

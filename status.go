@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 // 웹 API 를 부르는 명령 : 인자 = API 경로 (/api/ 뒤), 이름=값 = 질의, 옵션 = HTTP 방법 (1 대 1)
 //
 //	bongsudae -status  a b c k=v           GET    /api/a/b/c?k=v   (인자 없으면 routers)
@@ -340,6 +342,9 @@ func printPeer(p *peerJSON) {
 	fmt.Println()
 	fmt.Printf("  session   local %s:%d  remote port %d  hold sent %d / recv %d\n", d.LocalIP, d.LocalPort, d.RemotePort, d.HoldSent, d.HoldRecv)
 	fmt.Printf("  sent cap  %s\n  recv cap  %s\n", d.SentCaps, d.RecvCaps)
+	if d.TableName != "" || d.InfoData != "" {
+		fmt.Printf("  table     %s  info %s\n", d.TableName, d.InfoData)
+	}
 	fmt.Printf("  routes    v4 %d / v6 %d  (synced %v, settled %v, End-of-RIB v4 %s v6 %s)\n", p.RoutesV4, p.RoutesV6, p.Synced, p.Settled,
 		short(p.EoRV4), short(p.EoRV6))
 	fmt.Printf("  updates   last %s ago, add %d / del %d (since this up)\n", ago(p.LastUpdate), p.Adds, p.Dels)

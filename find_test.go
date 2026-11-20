@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 package main
 
 import (
@@ -14,7 +16,7 @@ import (
 
 // TestFind : findMany (more 를 한 번에 훑기, limit 을 줄여 가며 셈) 가 하나씩 찾은 것과 같은지, origin 필터
 func TestFind(t *testing.T) {
-	c := newCollector("x")
+	c := ribCollector("x")
 	rnd := rand.New(rand.NewSource(1))
 	attr := func(path string, origin uint32) unique.Handle[pathAttr] {
 		set := ""
@@ -111,7 +113,7 @@ func TestFind(t *testing.T) {
 
 // TestListFilter : 경로 목록의 offset / path_as / p + match / X-Total / X-Applied
 func TestListFilter(t *testing.T) {
-	c := newCollector("x")
+	c := ribCollector("x")
 	r := c.routerFor("192.0.2.1", "")
 	a1 := unique.Make(pathAttr{asPath: " 3356 64500", originAS: 64500})
 	a2 := unique.Make(pathAttr{asPath: " 3356 {64500,64496}", originSet: "{64500,64496}"})
@@ -206,7 +208,7 @@ func TestListFilter(t *testing.T) {
 
 // TestStatsAPI : 1 분 통계가 /api/stats 의 minutes 에 쌓임
 func TestStatsAPI(t *testing.T) {
-	c := newCollector("x")
+	c := ribCollector("x")
 	c.safeProcess(c.routerFor("1.2.3.4", ""), mustHex(t, "0300000033020000000000000000000000000000000000000000000001020305"+"00003b418efb31080000000000000000"+"020007"), testNow)
 	c.logStat(nil)
 	w := httptest.NewRecorder()

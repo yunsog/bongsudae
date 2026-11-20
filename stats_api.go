@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 // 운영 상태 API (10-30) : GET /api/stats
 //
 // 1 분 통계 (기록 파일의 "stat ..." 줄과 같은 수) 를 최근 60 분까지 메모리에 두고, 판 / 시작 시각 / 메모리 / Kafka 상태와 함께 줌.
@@ -23,7 +25,7 @@ type minuteStat struct {
 	Raw       *int64                `json:"raw,omitempty"`    // bmp_raw 로 보낸 수 (tcp 입력만)
 	KafkaFail int64                 `json:"kafka_fail_total"` // 시작 뒤 보내기 실패 모두
 	Topics    map[string]topicCount `json:"topics,omitempty"` // 토픽별 메시지 / 줄 (전달 규칙)
-	// OtherFamilies : 해석기가 없어 버린 경로 종류마다 MP_REACH / UNREACH 수 (0.3.0, 없으면 빠짐). counts.others 의 나눔
+	// OtherFamilies : (0.3.0, 없으면 빠짐) 모양을 몰라 NLRI hex 로만 낸 경로 수 (0.4.0~ other_family 토픽, 0.3 은 버린 MP_REACH / UNREACH 수). counts.others 의 나눔
 	OtherFamilies map[string]int `json:"other_families,omitempty"`
 	// ByRouter : 라우터별 같은 수 (0.2.0, 그 1 분에 메시지나 오류가 있던 라우터만). ?by_router=1 일 때만 내보냄
 	ByRouter map[string]map[string]int `json:"by_router,omitempty"`
@@ -86,7 +88,7 @@ func (s *stats) counts() map[string]int {
 
 // release : 판 번호 (GitHub 태그 v<release> 와 같음, 세 자리 = Go 모듈 판). 개발 중에는 "-dev" 를 붙이고,
 // 올리는 날 떼어 냄 (0.1.0 = 11-01 첫 공개, 0.2.0 = 11-03 공개)
-const release = "0.3.0"
+const release = "0.4.0"
 
 // version : 빌드 정보의 git rev (+ 빌드 때 고친 것이 있으면 "-modified")
 func version() string {

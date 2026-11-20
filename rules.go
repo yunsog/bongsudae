@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 // Kafka 전달 규칙 : unicast_prefix 메시지를 어느 토픽 (0 개 이상) 으로 보낼지
 //
 //	default                    모든 라우터의 기본 (지울 수 없음)

@@ -1,8 +1,11 @@
+// SPDX-License-Identifier: Apache-2.0
+
 // family.go : 경로 종류 (address family = AFI / SAFI, 0.3.0)
 //
-// 경로 종류를 더하는 자리 : NLRI 해석기 등록표 (nlriParsers). 등록된 종류만 해석하고, 나머지 MP_REACH / MP_UNREACH 는
-// 종류마다 세고 버림 (1 분 통계 other_families, /api/stats, /metrics). 지금 등록 = IPv4 / IPv6 unicast.
-// 새 종류 = 해석기 + 경로표 열쇠 (ribtable.go) + 출력기 (토픽) 를 더함 (docs/todo.md 2 장)
+// 경로 종류를 더하는 자리 : NLRI 해석기 등록표 (nlriParsers). 여기서는 IPv4 / IPv6 unicast, 나머지는 파일마다 init 에서 등록
+// (famroute.go, evpn.go, flowspec.go, 0.4.0 xroute.go 짜임 : bgpls.go, vpls.go, mvpn.go, srpolicy.go, rtc.go, otherfam.go).
+// 등록표에 없는 종류는 NLRI 통째로 other_family 줄 + 종류마다 셈 (1 분 통계 other_families, /api/stats, /metrics).
+// 새 종류 = 해석기 + 출력기 (토픽), 라우팅 테이블까지 들려면 열쇠 (ribtable.go) 도
 package main
 
 import (
@@ -134,19 +137,22 @@ func nextHopText(nh []byte) string {
 	return ""
 }
 
-// ---- 경로표를 들 종류 (설정 bmp.rib / 옵션 -rib, 0.3.0) ----
+// ---- 라우팅 테이블을 들 종류 (설정 bmp.rib / 옵션 -rib, 0.3.0) ----
 
-// defaultRIB : 기본 = 지금 운영과 같음 (IPv4 / IPv6 unicast)
-const defaultRIB = "ipv4-unicast,ipv6-unicast"
+// defaultRIB : 기본 = 라우팅 테이블 없음 (0.4.0~, 11-14 사용자 : 설정 bmp.rib / 옵션 -rib 로 켬). 0.3 까지는 IPv4 / IPv6 unicast
+const defaultRIB = "none"
 
-// parseRIBFamilies : "ipv4-unicast,vpnv4" -> 종류 모음. 0.2 의 true = unicast 둘, false / none = 없음 (넘기기만),
+// unicastRIB : 0.2 의 true (= IPv4 / IPv6 unicast)
+const unicastRIB = "ipv4-unicast,ipv6-unicast"
+
+// parseRIBFamilies : "ipv4-unicast,vpnv4" -> 종류 모음. 0.2 의 true = unicast 둘, 빈 글자 / false / none = 없음 (넘기기만),
 // all = 해석기가 있는 종류 모두. 해석기가 아직 없는 종류도 받음 (그 종류를 만드는 판부터 쓰임)
 func parseRIBFamilies(s string) (map[family]bool, error) {
 	out := map[family]bool{}
 	switch strings.TrimSpace(s) {
-	case "true", "":
-		s = defaultRIB
-	case "false", "none":
+	case "true":
+		s = unicastRIB
+	case "", "false", "none":
 		return out, nil
 	case "all":
 		for f := range ribSupported {
@@ -164,7 +170,7 @@ func parseRIBFamilies(s string) (map[family]bool, error) {
 	return out, nil
 }
 
-// ribSupported : 경로표를 들 수 있는 종류 (0.3.0 : unicast + famrib.go 의 labeled unicast / L3VPN / multicast)
+// ribSupported : 라우팅 테이블을 들 수 있는 종류 (0.3.0 : unicast + famrib.go 의 labeled unicast / L3VPN / multicast)
 var ribSupported = map[family]bool{famOf(afiIPv4, safiUnicast): true, famOf(afiIPv6, safiUnicast): true}
 
 func init() {
@@ -173,7 +179,7 @@ func init() {
 	}
 }
 
-// ribOn : 경로표를 드는 종류 : unicast 둘 (빠른 길) + 그 밖 종류 (famrib.go)
+// ribOn : 라우팅 테이블을 드는 종류 : unicast 둘 (빠른 길) + 그 밖 종류 (famrib.go)
 type ribOn struct {
 	v4, v6 bool
 	fam    map[family]bool

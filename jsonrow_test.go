@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 package main
 
 import (
@@ -60,7 +62,7 @@ func TestJSONRows(t *testing.T) {
 	rp := &rowPeer{routerHash: "r", routerIP: "192.0.2.1", peerHash: "p", peerIP: "198.51.100.1", peerAS: 64496,
 		ts: "2026-11-01 00:00:00.000000", prePolicy: true, adjRibIn: false}
 	run := func(js bool) []outMsg {
-		c := newCollector("x")
+		c := ribCollector("x")
 		c.json = js
 		return c.updateMsgs(&router{}, rp, u)
 	}
@@ -109,7 +111,7 @@ func TestJSONRows(t *testing.T) {
 
 // router / peer : 줄 하나 = 객체 하나, 빈 숫자 칸은 뺌
 func TestJSONRouterPeer(t *testing.T) {
-	c := newCollector("x")
+	c := ribCollector("x")
 	c.json = true
 	r := c.routerFor("192.0.2.100", "")
 	init := c.initiation(r, []byte("\x00\x02\x00\x02r1\x00\x01\x00\x03a\nb"), testNow)

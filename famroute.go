@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 // famroute.go : unicast 밖 경로 종류의 해석과 Kafka 줄 (0.3.0 1 차 : labeled unicast, L3VPN, multicast)
 //
 //	종류                         SAFI   NLRI                                         토픽 (<prefix>.)      줄
@@ -5,7 +7,7 @@
 //	VPNv4 / VPNv6 (L3VPN)         128    라벨 스택 + RD 8 바이트 + 프리픽스 (RFC 4364, 4659) l3vpn          openbmp l3vpn 34 칸 (31 뒤에 RD, RD 종류)
 //	IPv4 / IPv6 multicast         2      프리픽스 (unicast 와 같음)                   multicast_prefix      unicast_prefix 32 칸
 //
-// 토픽은 종류마다 고정 (전달 규칙은 unicast_prefix 만). 처음 쓸 때 만듦 (kafka.go). 경로표는 famrib.go. EVPN 은 evpn.go, FlowSpec 은 flowspec.go
+// 토픽은 종류마다 고정 (전달 규칙은 unicast_prefix 만). 처음 쓸 때 만듦 (kafka.go). 라우팅 테이블은 famrib.go. EVPN 은 evpn.go, FlowSpec 은 flowspec.go
 // labels 칸 = 라벨 값 (20 비트) 을 쉼표로 (openbmp 스키마 "comma delimited list"). 철회의 호환 라벨 (0x800000, RFC 8277 2.4) 은 내지 않음
 package main
 
@@ -41,11 +43,12 @@ type famUpdate struct {
 
 	eAdd, eDel   []evpnRoute // EVPN (evpn.go) : 프리픽스가 아니라 경로 종류마다 다른 칸
 	fsAdd, fsDel []fsRule    // FlowSpec (flowspec.go) : 규칙
+	xAdd, xDel   []xRoute    // 0.4.0 종류 (xroute.go : BGP-LS, VPLS, MVPN, SR Policy, RT Constraint, other_family)
 }
 
 // count : 이 묶음의 경로 / 규칙 수
 func (fu *famUpdate) count() int {
-	return len(fu.add) + len(fu.del) + len(fu.eAdd) + len(fu.eDel) + len(fu.fsAdd) + len(fu.fsDel)
+	return len(fu.add) + len(fu.del) + len(fu.eAdd) + len(fu.eDel) + len(fu.fsAdd) + len(fu.fsDel) + len(fu.xAdd) + len(fu.xDel)
 }
 
 // famFor : 이 UPDATE 의 종류 f 묶음 (없으면 만듦)
@@ -204,6 +207,10 @@ func (c *collector) famMsgs(r *router, rp *rowPeer, u *update, out []outMsg) []o
 		}
 		if _, ok := fsFams[fu.f]; ok {
 			out = c.fsMsgs(r, rp, u, fu, out)
+			continue
+		}
+		if len(fu.xAdd)+len(fu.xDel) > 0 {
+			out = c.xMsgs(r, rp, u, fu, out)
 			continue
 		}
 		sp, ok := famSpecs[fu.f]

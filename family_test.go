@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 package main
 
 import (
@@ -25,18 +27,19 @@ func TestFamilyNames(t *testing.T) {
 	}
 }
 
-// 해석기가 없는 종류 (BGP-LS MP_REACH) : 오류가 아니라 종류마다 세고 버림, 같은 UPDATE 의 unicast 는 그대로
+// 등록표에 없는 종류 (99/9) : 오류가 아니라 세고 (other_families) NLRI 통째로 other_family 줄 하나, 같은 UPDATE 의 unicast 는 그대로
 func TestOtherFamily(t *testing.T) {
-	// ORIGIN, AS_PATH 64496, MP_REACH bgp-ls (몸통은 해석하지 않음), NLRI 198.51.100.0/24
-	mp := "4004" + "47" + "0c" + "0000000000000000" + "c0000201" + "00" + "70" + "000011" + "0000fbf000000001" + "cb0071"
+	// ORIGIN, AS_PATH 64496, MP_REACH 99/9 (몸통은 해석하지 않음), NLRI 198.51.100.0/24
+	mp := "0063" + "09" + "0c" + "0000000000000000" + "c0000201" + "00" + "70" + "000011" + "0000fbf000000001" + "cb0071"
 	body := mustHex(t, "0000"+"0037"+"40010100"+"400206020100"+"00fbf0"+"400304c0000201"+"800e20"+mp+"18c63364")
 	u, err := parseUpdate(body, pathOpts{as4: true})
-	if err != nil || u.others != 1 || len(u.otherFams) != 1 || u.otherFams[0].String() != "bgp-ls" || len(u.v4Add) != 1 {
+	if err != nil || u.others != 1 || len(u.otherFams) != 1 || u.otherFams[0].String() != "99/9" || len(u.v4Add) != 1 ||
+		len(u.fams) != 1 || len(u.fams[0].xAdd) != 1 || u.fams[0].xAdd[0].get("nlri") != "70000011"+"0000fbf000000001"+"cb0071" {
 		t.Fatalf("%v others %d fams %v v4 %d", err, u.others, u.otherFams, len(u.v4Add))
 	}
-	// 그 종류의 End-of-RIB (빈 MP_UNREACH) 도 세고 버림 : unicast EoR 이 아님
-	u, err = parseUpdate(mustHex(t, "0000"+"0006"+"800f03"+"400447"), pathOpts{as4: true})
-	if err != nil || u.eorV4 || u.eorV6 || u.others != 1 {
+	// 그 종류의 End-of-RIB (빈 MP_UNREACH) : 그 종류의 eor, unicast EoR 이 아님
+	u, err = parseUpdate(mustHex(t, "0000"+"0006"+"800f03"+"006309"), pathOpts{as4: true})
+	if err != nil || u.eorV4 || u.eorV6 || u.others != 0 || len(u.fams) != 1 || !u.fams[0].eor {
 		t.Fatalf("vpn EoR : %v %+v", err, u)
 	}
 	// 1 분 통계 글자
@@ -65,7 +68,7 @@ func TestFamsOn(t *testing.T) {
 // -rib / bmp.rib : 종류 목록, 0.2 의 true / false 도
 func TestRIBFamilies(t *testing.T) {
 	for s, want := range map[string]string{
-		"true": "ipv4-unicast,ipv6-unicast", "": "ipv4-unicast,ipv6-unicast", "false": "", "none": "",
+		"true": "ipv4-unicast,ipv6-unicast", "": "", "false": "", "none": "",
 		"all": "ipv4-unicast,ipv4-multicast,ipv4-labeled,vpnv4,ipv4-flowspec,vpnv4-flowspec,ipv6-unicast,ipv6-multicast,ipv6-labeled,vpnv6,ipv6-flowspec,vpnv6-flowspec", "ipv4-unicast, vpnv4": "ipv4-unicast,vpnv4", "ipv6-unicast": "ipv6-unicast",
 	} {
 		m, err := parseRIBFamilies(s)
@@ -82,9 +85,9 @@ func TestRIBFamilies(t *testing.T) {
 	}
 }
 
-// IPv6 경로표만 끔 : IPv6 경로는 표에 없고 (Kafka 줄은 그대로), 옛 판이 넘긴 IPv6 표도 버림, API 경고
+// IPv6 라우팅 테이블만 끔 : IPv6 경로는 표에 없고 (Kafka 줄은 그대로), 옛 판이 넘긴 IPv6 표도 버림, API 경고
 func TestRIBPartial(t *testing.T) {
-	c := newCollector("x")
+	c := ribCollector("x")
 	fams, _ := parseRIBFamilies("ipv4-unicast")
 	c.setRIB(fams)
 	r := c.routerFor("192.0.2.1", "")
@@ -109,5 +112,16 @@ func TestRIBPartial(t *testing.T) {
 	p.ribLoaded(tabs, c.on)
 	if p.view(-1).rib6.size() != 0 {
 		t.Fatal("ipv6 table from the old process must be dropped")
+	}
+}
+
+// 0.4.0~ 기본 = 라우팅 테이블 없음 (설정 / 옵션으로 켬)
+func TestRIBDefaultOff(t *testing.T) {
+	c := newCollector("x")
+	if c.on.v4 || c.on.v6 || len(c.on.fam) != 0 || len(c.rib) != 0 {
+		t.Fatalf("default must be off : %+v %v", c.on, c.rib)
+	}
+	if f, _ := parseRIBFamilies(defaultRIB); len(f) != 0 {
+		t.Fatal(f)
 	}
 }

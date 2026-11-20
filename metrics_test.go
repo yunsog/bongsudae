@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 package main
 
 import (
@@ -9,7 +11,7 @@ import (
 
 // /metrics : 줄마다 Prometheus 글자 꼴, metric 마다 HELP / TYPE 한 번, 같은 이름의 줄은 붙어 있음
 func TestMetrics(t *testing.T) {
-	c := newCollector("x")
+	c := ribCollector("x")
 	r := c.routerFor("192.0.2.100", "")
 	r.sysName = `name "with" \ quote`
 	c.safeProcess(r, mustHex(t, "03000000440300000000000000000000000000000000000000000000c63364670000fbf0c63364676ae222c300051812000000000000000000000000c0000264e2e800b3"), testNow)

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 package main
 
 import (
@@ -8,7 +10,7 @@ import (
 	"unique"
 )
 
-// allOn : 시험용 = 경로표를 모두 켬
+// allOn : 시험용 = 라우팅 테이블을 모두 켬
 var allOn = ribOn{v4: true, v6: true}
 
 // inPre : 시험용 = peer 의 In pre-policy 보기 (없으면 만듦)
@@ -40,7 +42,7 @@ func TestViewOf(t *testing.T) {
 
 // 같은 네이버의 보기는 따로 : post-policy 에서 지워도 pre-policy 경로는 남고, 경로 수 / API 가 보기마다
 func TestViewsSeparate(t *testing.T) {
-	c := newCollector("x")
+	c := ribCollector("x")
 	r := c.routerFor("192.0.2.1", "")
 	p := r.peerGet(&peerHdr{addr: netip.MustParseAddr("198.51.100.1"), as: 64500})
 	p.up, p.gotUp, p.famV4 = true, true, true
@@ -92,7 +94,7 @@ func TestViewsSeparate(t *testing.T) {
 
 // 상태 파일 : 형식 2 는 보기마다 왕복, 형식 1 (0.2) 은 보기 하나 = 마지막 머리의 보기로 읽음, 보기가 둘인데 형식 1 로 쓰면 오류
 func TestStateViews(t *testing.T) {
-	c := newCollector("x")
+	c := ribCollector("x")
 	r := c.routerFor("192.0.2.1", "")
 	a := attrs{asPath: " 64500", originAS: 64500, nextHop: "198.51.100.1"}
 	one := func(s string) []prefix {
@@ -111,7 +113,7 @@ func TestStateViews(t *testing.T) {
 	if _, n, err := writeHandover(path, &handoverState{Version: 2}, c); err != nil || n != 2 {
 		t.Fatal(n, err)
 	}
-	c2 := newCollector("x")
+	c2 := ribCollector("x")
 	hs, err := readHandover(path)
 	if err != nil {
 		t.Fatal(err)
@@ -135,7 +137,7 @@ func TestStateViews(t *testing.T) {
 	if _, n, err := writeHandover(path1, &handoverState{Version: 1}, c); err != nil || n != 1 {
 		t.Fatal(n, err)
 	}
-	c3 := newCollector("x")
+	c3 := ribCollector("x")
 	hs1, err := readHandover(path1)
 	if err != nil {
 		t.Fatal(err)

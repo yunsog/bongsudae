@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 // evpn.go : EVPN (AFI 25 / SAFI 70, RFC 7432, 8365, 9136) 해석과 Kafka 줄 (0.3.0 2 차). 토픽 <prefix>.evpn
 //
 // 줄 = openbmp 스키마 evpn 40 칸 (https://www.openbmp.org/api/kafka_message_schema.html) :
@@ -11,7 +13,7 @@
 // 경로 종류 (route type) 칸은 스키마에 없음 : 1 Ethernet A-D, 2 MAC/IP, 3 Inclusive Multicast, 4 Ethernet Segment, 5 IP Prefix.
 // 5 (RFC 9136) 의 IP 프리픽스는 ip_len / ip 에 (길이 / 주소), gateway 는 TSV 칸이 없음. JSON 에는 route_type, gateway_ip 를 더함.
 // 라벨 : MPLS 라벨 값 (20 비트). encapsulation ext community 가 VXLAN / NVGRE / VXLAN-GPE (8 / 9 / 12, RFC 8365) 면 24 비트 VNI.
-// 경로표는 아직 없음 (Kafka 줄만, bmp.rib 에 l2vpn-evpn 을 적어도 기록 한 줄)
+// 라우팅 테이블은 아직 없음 (Kafka 줄만, bmp.rib 에 l2vpn-evpn 을 적어도 기록 한 줄)
 package main
 
 import (

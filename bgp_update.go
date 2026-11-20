@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 // BGP UPDATE 해석 (RFC 4271, 4760, 6793, 7911) : 경로 속성 + NLRI
 //
 // 속성 글자 모양은 openbmpd v1.7 출력과 같게 만듦 (표본으로 확인).
@@ -27,6 +29,8 @@ const (
 	attrAS4Path     = 17
 	attrAS4Agg      = 18
 	attrLargeComm   = 32
+	attrTunnelEncap = 23 // RFC 9012 (SR Policy)
+	attrBGPLS       = 29 // RFC 9552
 )
 
 // prefix : NLRI 하나
@@ -64,8 +68,10 @@ type update struct {
 	v4Del     []prefix
 	v6Add     []prefix
 	v6Del     []prefix
-	others    int         // 해석기가 없는 종류의 MP_REACH / UNREACH 수 (VPN, EVPN 등 : 세고 버림)
+	others    int         // 모양을 모르는 경로 수 (0.4.0~ : other_family 토픽에 NLRI hex 로 냄)
 	otherFams []family    // 그 종류들 (하나씩, 같은 것 여럿 가능. 보통 nil)
+	lsAttr    []byte      // BGP-LS 속성 (종류 29, RFC 9552) 값 : ls_* 줄을 만들 때 해석 (bgpls.go)
+	tunEncap  []byte      // Tunnel Encapsulation 속성 (종류 23, RFC 9012) 값 : sr_policy 줄 (srpolicy.go)
 	fams      []famUpdate // unicast 밖 해석하는 종류 (labeled unicast, L3VPN, multicast : famroute.go, 보통 nil)
 
 	eorV4, eorV6 bool // End-of-RIB (RFC 4724) : 처음 전체 전송이 끝났다는 표시
@@ -89,7 +95,7 @@ func (o pathOpts) addPathFor(f family) bool {
 	return false
 }
 
-// other : 해석기가 없는 종류의 MP_REACH / UNREACH 하나 (세고 버림)
+// other : 모양을 모르는 경로 하나 (세기만 함. 줄은 other_family 토픽에 hex 로 나감)
 func (u *update) other(f family) {
 	u.others++
 	u.otherFams = append(u.otherFams, f)
@@ -285,6 +291,10 @@ func parseAttr(typ uint8, v []byte, o pathOpts, u *update) error {
 		a.extComm = extCommString(v)
 	case attrLargeComm:
 		a.largeComm = largeCommString(v)
+	case attrBGPLS:
+		u.lsAttr = append([]byte(nil), v...)
+	case attrTunnelEncap:
+		u.tunEncap = append([]byte(nil), v...)
 	}
 	return nil
 }
@@ -475,9 +485,8 @@ func parseMPReach(v []byte, o pathOpts, u *update) error {
 	}
 	f := famOf(afi, safi)
 	ps, ok := nlriParsers[f]
-	if !ok {
-		u.other(f)
-		return nil
+	if !ok { // 등록표에 없는 종류 : NLRI 를 통째로 hex 로 (otherfam.go)
+		ps = rawParser(f)
 	}
 	return ps.reach(u, v[4:4+nl], v[4+nl+1:], o)
 }
@@ -490,8 +499,7 @@ func parseMPUnreach(v []byte, o pathOpts, u *update) error {
 	f := famOf(be16(v), v[2])
 	ps, ok := nlriParsers[f]
 	if !ok {
-		u.other(f)
-		return nil
+		ps = rawParser(f)
 	}
 	return ps.unreach(u, v[3:], o)
 }

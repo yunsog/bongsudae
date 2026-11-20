@@ -1,15 +1,17 @@
+// SPDX-License-Identifier: Apache-2.0
+
 // collector : BMP 메시지 하나를 받아 unicast_prefix / router / peer 메시지들로 바꿈
 //
-// 라우터마다, peer 마다 상태 (해시, Add-Path, 현황, 경로표 = rib.go) 를 들고 있음.
+// 라우터마다, peer 마다 상태 (해시, Add-Path, 현황, 라우팅 테이블 = rib.go) 를 들고 있음.
 // 입력 (TCP / Kafka bmp_raw / 파일) 과 출력 (Kafka / 파일) 은 이 파일 밖에서.
 //
-// 여러 코어로 (10-29) : 라우터마다 goroutine 하나가 그 라우터의 메시지를 차례로 처리 (해석, 줄 만들기, 경로표).
+// 여러 코어로 (10-29) : 라우터마다 goroutine 하나가 그 라우터의 메시지를 차례로 처리 (해석, 줄 만들기, 라우팅 테이블).
 // 서로 다른 라우터는 동시에. 같은 라우터 (= 같은 peer) 의 메시지 순서는 그대로.
 //
 // 잠금 (C 의 pthread_mutex 와 같음, 잡는 순서는 늘 c.mu -> r.mu -> rules.mu) :
 //
 //	c.mu   라우터 목록 (routers map), closeRouter. 라우터를 찾거나 만들 때만 잠깐
-//	r.mu   라우터 하나의 모든 것 (peer, 경로표, 번호, 통계). 처리 = 쓰기 잠금, 웹 API = 읽기 잠금
+//	r.mu   라우터 하나의 모든 것 (peer, 라우팅 테이블, 번호, 통계). 처리 = 쓰기 잠금, 웹 API = 읽기 잠금
 //	c.seq  줄 번호 : 원자적 덧셈 (메시지마다 번호 묶음을 받음)
 //
 // 입력 쪽은 handle / connStart / connClosed 를 부름 (잠금 포함).
@@ -19,6 +21,7 @@ import (
 	"fmt"
 	"log"
 	"net/netip"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -53,7 +56,7 @@ type router struct {
 	lastResetWhy      string
 }
 
-// reset : 새 BMP 세션 - 남아 있던 peer 는 down (경로표 비움), 번호를 처음으로
+// reset : 새 BMP 세션 - 남아 있던 peer 는 down (라우팅 테이블 비움), 번호를 처음으로
 func (r *router) reset(t time.Time) {
 	for _, p := range r.peers {
 		p.markDown(t, "new BMP session")
@@ -67,7 +70,7 @@ type collector struct {
 	cHash string       // C_HASH_ID (collector 해시, openbmpd 설정 값 그대로)
 	// keyBuckets : unicast_prefix 메시지를 프리픽스 칸으로 나눔 (Kafka key 1-B, -key-buckets). 0 = 나누지 않음 (key = peer hash)
 	keyBuckets int
-	// rib : 경로표를 드는 경로 종류 (-rib / bmp.rib, 0.3.0 : 종류 목록). 줄 / Kafka 는 같고, 꺼진 종류는 경로 수 / 찾기 API 만 못 씀 (메모리 대비)
+	// rib : 라우팅 테이블을 드는 경로 종류 (-rib / bmp.rib, 0.3.0 : 종류 목록). 줄 / Kafka 는 같고, 꺼진 종류는 경로 수 / 찾기 API 만 못 씀 (메모리 대비)
 	// noRIB = 하나도 없음 (0.2.0 의 -rib=false), on = unicast 둘의 켜짐
 	rib   map[family]bool
 	noRIB bool
@@ -89,8 +92,7 @@ type collector struct {
 
 func newCollector(cHash string) *collector {
 	c := &collector{cHash: cHash, routers: map[string]*router{}}
-	fams, _ := parseRIBFamilies(defaultRIB) // 기본 = IPv4 / IPv6 unicast 경로표 (옵션 -rib 이 바꿈 : setRIB)
-	c.setRIB(fams)
+	c.setRIB(map[family]bool{}) // 기본 = 라우팅 테이블 없음 (0.4.0~, 설정 bmp.rib / 옵션 -rib 이 바꿈 : setRIB)
 	return c
 }
 
@@ -209,7 +211,7 @@ func (c *collector) routeMon(r *router, b []byte, now time.Time) ([]outMsg, erro
 	for _, f := range u.otherFams {
 		r.stat.addOther(f, 1)
 	}
-	v := viewOf(h.typ, h.flags) // 보기 (In / Out, pre / post, Loc-RIB) 마다 경로표 따로 (rib.go)
+	v := viewOf(h.typ, h.flags) // 보기 (In / Out, pre / post, Loc-RIB) 마다 라우팅 테이블 따로 (rib.go)
 	if c.noRIB {
 		p.countOnly(v, u, now)
 	} else {
@@ -286,15 +288,15 @@ func (c *collector) peerUp(r *router, b []byte, now time.Time) ([]outMsg, error)
 			r.ip, h.addr, h.as)
 		r.stat.noOpen++
 		r.noOpen++
-		p := c.peerSession(r, &h, local, lport, rport, nil, nil, now)
+		p, _ := c.peerSession(r, &h, local, lport, rport, nil, nil, now)
 		p.noOpen = true
-		return []outMsg{c.peerUpMsg(r, &h, local, lport, rport, nil, nil, now)}, nil
+		return []outMsg{c.peerUpMsg(r, &h, local, lport, rport, nil, nil, "", "", now)}, nil
 	}
 	typ1, sentBody, rest, err := bgpMsg(b[20:])
 	if err != nil {
 		return nil, fmt.Errorf("peer_up sent open: %w", err)
 	}
-	typ2, recvBody, _, err := bgpMsg(rest)
+	typ2, recvBody, tlvBytes, err := bgpMsg(rest) // 받은 OPEN 뒤 = 정보 TLV (없을 수 있음)
 	if err != nil {
 		return nil, fmt.Errorf("peer_up recv open: %w", err)
 	}
@@ -306,8 +308,35 @@ func (c *collector) peerUp(r *router, b []byte, now time.Time) ([]outMsg, error)
 	if err1 != nil || err2 != nil {
 		return nil, fmt.Errorf("peer_up open: %v %v", err1, err2)
 	}
-	c.peerSession(r, &h, local, lport, rport, &sent, &recv, now)
-	return []outMsg{c.peerUpMsg(r, &h, local, lport, rport, &sent, &recv, now)}, nil
+	p, merged := c.peerSession(r, &h, local, lport, rport, &sent, &recv, now)
+	info, table := peerUpInfo(tlvBytes)
+	if merged { // 같은 Loc-RIB 의 다른 주소 종류 : peer 에는 이어 붙임 (예 "inet.0 inet6.0"), 메시지 줄에는 이 Peer Up 의 것만
+		p.infoData, p.tableName = joinWord(p.infoData, info), joinWord(p.tableName, table)
+	} else {
+		p.infoData, p.tableName = info, table
+	}
+	return []outMsg{c.peerUpMsg(r, &h, local, lport, rport, &sent, &recv, info, table, now)}, nil
+}
+
+// joinWord : 두 글자를 공백으로 (빈 것은 빼고, 같으면 하나)
+func joinWord(a, b string) string {
+	switch {
+	case a == "" || a == b:
+		return b
+	case b == "":
+		return a
+	}
+	return a + " " + b
+}
+
+// peerUpInfo : Peer Up 정보 TLV -> (TLV 0 글자, TLV 3 표 이름). RFC 7854 4.10 / RFC 9069 5.
+// 그 밖의 종류는 버림. 탭은 공백, 줄바꿈은 \n 글자로 (clean : 메시지 줄이 깨지지 않게, router 메시지와 같음)
+func peerUpInfo(b []byte) (info, table string) {
+	if len(b) == 0 {
+		return "", ""
+	}
+	t := tlvs(b)
+	return clean(t[0]), clean(t[3])
 }
 
 // peerDown : 상태를 지우고 peer down 메시지 (openbmpd 처럼 del 줄은 만들지 않음)
@@ -321,13 +350,21 @@ func (c *collector) peerDown(r *router, b []byte, now time.Time) ([]outMsg, erro
 	return []outMsg{m}, nil
 }
 
-// peerSession : Peer Up -> peer 현황 (새 세션 : 경로표를 비우고 처음부터). sent / recv 가 nil 이면 OPEN 없음
-func (c *collector) peerSession(r *router, h *peerHdr, local netip.Addr, lport, rport uint16, sent, recv *openMsg, now time.Time) *peer {
+// peerSession : Peer Up -> peer 현황 (새 세션 : 라우팅 테이블을 비우고 처음부터). sent / recv 가 nil 이면 OPEN 없음.
+// (0.4.0) 같은 Loc-RIB 의 다른 주소 종류 Peer Up 이면 (RFC 9069 6.1.1) 비우지 않고 종류를 더함 : merged = true
+func (c *collector) peerSession(r *router, h *peerHdr, local netip.Addr, lport, rport uint16, sent, recv *openMsg, now time.Time) (*peer, bool) {
 	p := r.peerGet(h)
+	if sent != nil && recv != nil {
+		if fams := famsOn(*sent, *recv); addsFamilies(p, h, fams) {
+			mergeLocRIB(p, *sent, *recv, fams, now)
+			return p, true
+		}
+	}
 	p.clearRIB()
 	p.up, p.gotUp, p.noOpen, p.since, p.downReason = true, true, false, now, ""
 	p.localIP, p.localPort, p.rmtPort = local.String(), lport, rport
 	p.holdSent, p.holdRecv, p.sentCaps, p.recvCaps = 0, 0, "", ""
+	p.infoData, p.tableName = "", "" // 있으면 peerUp 이 다시 채움
 	p.addPathV4, p.addPathV6, p.famV4, p.famV6 = false, false, false, false
 	p.fams, p.addPathFams = nil, nil
 	if sent != nil && recv != nil {
@@ -345,7 +382,48 @@ func (c *collector) peerSession(r *router, h *peerHdr, local netip.Addr, lport, 
 		p.addPathV6 = addPathOn(*sent, *recv, afiIPv6, safiUnicast)
 	}
 	p.addEvent(now, "up (Peer Up)")
-	return p
+	return p, false
+}
+
+// addsFamilies : RFC 9069 6.1.1 - 라우터는 같은 Loc-RIB 를 주소 종류마다 다른 가상 peer 로 보낼 수 있음
+// (distinguisher / BGP ID 같음, 받는 쪽은 OPEN 능력으로 가림 : MUST). 예 Junos = inet.0 (IPv4), inet6.0 (IPv6) Peer Up 둘.
+// 이미 up 인 Loc-RIB peer 에 종류가 하나도 겹치지 않는 Peer Up 이 오면 true (새 세션이 아니라 종류를 더함).
+// 겹치면 그 종류의 새 세션 = 전과 같이 라우팅 테이블을 비우고 처음부터
+func addsFamilies(p *peer, h *peerHdr, fams []family) bool {
+	if h.typ != peerTypeLocRIB || !p.up || !p.gotUp || p.noOpen || len(p.fams) == 0 || len(fams) == 0 || p.bgpIDRaw != h.bgpID {
+		return false
+	}
+	for _, f := range fams {
+		if slices.Contains(p.fams, f) {
+			return false
+		}
+	}
+	return true
+}
+
+// mergeLocRIB : 같은 Loc-RIB 의 다른 주소 종류 Peer Up 을 peer 에 더함 (라우팅 테이블 / End-of-RIB 는 그대로)
+func mergeLocRIB(p *peer, sent, recv openMsg, fams []family, now time.Time) {
+	p.fams = append(p.fams, fams...)
+	for _, f := range fams {
+		if addPathOn(sent, recv, f.afi(), f.safi()) {
+			p.addPathFams = append(p.addPathFams, f)
+		}
+	}
+	p.famV4 = p.famV4 || famOn(sent, recv, afiIPv4, safiUnicast)
+	p.famV6 = p.famV6 || famOn(sent, recv, afiIPv6, safiUnicast)
+	p.addPathV4 = p.addPathV4 || addPathOn(sent, recv, afiIPv4, safiUnicast)
+	p.addPathV6 = p.addPathV6 || addPathOn(sent, recv, afiIPv6, safiUnicast)
+	p.sentCaps = joinCaps(p.sentCaps, strings.Join(sent.caps, ", "))
+	p.recvCaps = joinCaps(p.recvCaps, strings.Join(recv.caps, ", "))
+	p.addEvent(now, "up (Peer Up, adds "+strings.Join(familyList(fams), ", ")+" to the same Loc-RIB)")
+}
+
+// joinCaps : 가상 peer 마다 능력 글자를 " | " 로 (같으면 하나)
+func joinCaps(a, b string) string {
+	if a == "" || a == b {
+		return b
+	}
+	return a + " | " + b
 }
 
 // downText : peer down 메시지 (탭 구분 31 필드) 에서 이유 글자 (21 bmp_reason, 22/23 코드, 24 글자)
@@ -497,7 +575,7 @@ func (c *collector) logStat(p *producer) {
 	hist.add(m, &total, p) // GET /api/stats (stats_api.go), /metrics (metrics.go)
 }
 
-// setRIB : 경로표를 들 종류를 정함 (시작 때). 해석기가 아직 없는 종류는 기록 한 줄
+// setRIB : 라우팅 테이블을 들 종류를 정함 (시작 때). 해석기가 아직 없는 종류는 기록 한 줄
 func (c *collector) setRIB(fams map[family]bool) {
 	c.rib = fams
 	c.noRIB = len(fams) == 0
@@ -521,7 +599,7 @@ func (c *collector) setRIB(fams map[family]bool) {
 	}
 }
 
-// ribOff : peer 가 협상한 종류 (fams, 없으면 unicast 둘) 중 경로표를 들 수 있는데 꺼진 것 (API 경고)
+// ribOff : peer 가 협상한 종류 (fams, 없으면 unicast 둘) 중 라우팅 테이블을 들 수 있는데 꺼진 것 (API 경고)
 func (c *collector) ribOff(fams []family) []string {
 	if len(fams) == 0 {
 		fams = []family{famOf(afiIPv4, safiUnicast), famOf(afiIPv6, safiUnicast)}

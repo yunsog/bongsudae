@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 // openbmp v1.7 unicast_prefix 줄과 메시지 만들기
 //
 // 메시지 = 머리 (V, C_HASH_ID, T, L, R) + 빈 줄 + 줄들 (탭 구분 32 필드, 끝 "\n")

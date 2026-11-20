@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 package main
 
 import (
@@ -70,7 +72,7 @@ func TestFlowSpecOps(t *testing.T) {
 	}
 }
 
-// 경로표 : bmp.rib 에 ipv4-flowspec 을 적으면 규칙을 들고, 찾기 = 목적지 프리픽스, 철회, 상태 파일 왕복
+// 라우팅 테이블 : bmp.rib 에 ipv4-flowspec 을 적으면 규칙을 들고, 찾기 = 목적지 프리픽스, 철회, 상태 파일 왕복
 func TestFlowSpecRIB(t *testing.T) {
 	c, r, p := vpnCollector("ipv4-unicast,ipv4-flowspec")
 	rule := "0118cb0071" + "038106"

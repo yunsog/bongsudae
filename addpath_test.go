@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 package main
 
 import (
@@ -42,7 +44,7 @@ func TestAddPathTable(t *testing.T) {
 	}
 }
 
-// 실제 UPDATE 바이트 (Add-Path NLRI : path ID 4 바이트 + 길이 + 프리픽스) -> peer 경로표 / API
+// 실제 UPDATE 바이트 (Add-Path NLRI : path ID 4 바이트 + 길이 + 프리픽스) -> peer 라우팅 테이블 / API
 func TestAddPathUpdate(t *testing.T) {
 	// ORIGIN igp, AS_PATH 64496, NEXT_HOP 192.0.2.1, NLRI : id 1 203.0.113.0/24, id 2 203.0.113.0/24
 	body := mustHex(t, "0000"+"0014"+"40010100"+"400206020100"+"00fbf0"+"400304c0000201"+
@@ -51,7 +53,7 @@ func TestAddPathUpdate(t *testing.T) {
 	if err != nil || len(u.v4Add) != 2 || u.v4Add[1].pathID != 2 {
 		t.Fatalf("parse %v %+v", err, u)
 	}
-	c := newCollector("x")
+	c := ribCollector("x")
 	r := c.routerFor("192.0.2.1", "")
 	p := r.peerGet(&peerHdr{addr: netip.MustParseAddr("198.51.100.1"), as: 64496})
 	p.up, p.addPathV4 = true, true
@@ -89,7 +91,7 @@ func TestAddPathUpdate(t *testing.T) {
 
 // 상태 파일 : 형식 2 는 Add-Path 경로를 왕복, 형식 1 은 못 담아 오류
 func TestStateAddPath(t *testing.T) {
-	c := newCollector("x")
+	c := ribCollector("x")
 	r := c.routerFor("192.0.2.1", "")
 	p := r.peerGet(&peerHdr{addr: netip.MustParseAddr("198.51.100.1"), as: 64496})
 	p.up, p.addPathV4, p.addPathV6 = true, true, true
@@ -112,7 +114,7 @@ func TestStateAddPath(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	c2 := newCollector("x")
+	c2 := ribCollector("x")
 	hs.restore(c2)
 	hs.loadRIBs(c2)
 	q := c2.routers["192.0.2.1"].peers[p.key].view(-1)

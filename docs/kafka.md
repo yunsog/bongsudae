@@ -22,6 +22,12 @@ See also: the web API reference (`api.md`) and the user manual (`manual.md`).
 | `openbmp.parsed.multicast_prefix` | (0.3.0+) IPv4 / IPv6 multicast (SAFI 2) route lines: the same 32 fields as unicast_prefix | peer hash |
 | `openbmp.parsed.evpn` | (0.3.0+) EVPN (AFI 25 / SAFI 70) route lines: OpenBMP evpn, 40 fields (section 3.3) | peer hash |
 | `openbmp.parsed.flowspec` | (0.3.0+) FlowSpec rules (IPv4 / IPv6 / VPN, SAFI 133 / 134). **Bongsudae's own format**, 43 fields (section 3.4, not in OpenBMP) | peer hash |
+| `openbmp.parsed.ls_node`, `ls_link`, `ls_prefix` | (0.4.0+) BGP-LS (16388/71, 72, 80). OpenBMP schema fields + rd (section 3.6) | peer hash |
+| `openbmp.parsed.l2vpn_vpls` | (0.4.0+) VPLS (25/65). **Bongsudae's own format**, 29 fields (section 3.7) | peer hash |
+| `openbmp.parsed.mvpn` | (0.4.0+) MCAST-VPN (1, 2/5). **Bongsudae's own format**, 31 fields (section 3.8) | peer hash |
+| `openbmp.parsed.sr_policy` | (0.4.0+) SR Policy (1, 2/73). **Bongsudae's own format**, 32 fields (section 3.9) | peer hash |
+| `openbmp.parsed.rt_constraint` | (0.4.0+) RT Constraint (1/132). **Bongsudae's own format**, 26 fields (section 3.10) | peer hash |
+| `openbmp.parsed.other_family` | (0.4.0+) every other family (MDT, MUP, CAR, unknown ...). NLRI hex + decodable fields, **Bongsudae's own format**, 32 fields (section 3.11) | peer hash |
 
 - **Same key = same partition = order is kept.** The unicast_prefix and peer messages of one peer are read in the order they were sent.
   Order across topics is not guaranteed (for example, a peer down and that peer's unicast_prefix lines).
@@ -40,9 +46,9 @@ See also: the web API reference (`api.md`) and the user manual (`manual.md`).
 - **Forwarding rules** (section 1.1) can send unicast_prefix messages of a given router / peer to other topics, or not at all.
   peer, router and bmp_raw messages are always sent, regardless of the rules.
 - No compression (so consumers can read without a compression library).
-- openbmpd's `collector`, `bmp_stat`, `base_attribute` and `ls_*` topics are not produced.
-  Address families that are not parsed (BGP-LS, MVPN, RT constraint, ...) are counted per family and dropped (`other_families:` in the stat line).
-- (0.3.0+) **Address family topics** (`labeled_unicast_prefix`, `l3vpn`, `multicast_prefix`, `evpn`, `flowspec`) are created when the first such route arrives (log `kafka topic ... : first ... route`).
+- openbmpd's `collector`, `bmp_stat` and `base_attribute` topics are not produced. `ls_*` are produced from 0.4.0 (section 3.6).
+  (0.4.0+) Every address family is sent to Kafka (section 3.5). Routes of unknown shape go to `other_family` as NLRI hex and are also counted per family (`other_families:` in the stat line). Up to 0.3, BGP-LS, MVPN, RT constraint etc. were counted and dropped.
+- (0.3.0+) **Address family topics** (`labeled_unicast_prefix`, `l3vpn`, `multicast_prefix`, `evpn`, `flowspec`, 0.4.0+ `ls_*`, `l2vpn_vpls`, `mvpn`, `sr_policy`, `rt_constraint`, `other_family`) are created when the first such route arrives (log `kafka topic ... : first ... route`).
   Forwarding rules apply to unicast_prefix only; family rows always go to their topic. Row seq numbers share the unicast_prefix sequence.
   `labeled_unicast_prefix` has its own topic (openbmpd mixed it into unicast_prefix, where a withdrawal carries no labels and cannot be told apart from a unicast withdrawal); `multicast_prefix` has no OpenBMP counterpart.
 
@@ -170,6 +176,10 @@ the add message comes first. Within a message, IPv4 lines come before IPv6 lines
 - **Loc-RIB lines (RFC 9069) are the lines whose peer_ip (field 7) is `0.0.0.0`** (IPv6 routes too). The Loc-RIB per-peer header carries
   peer address 0, and peer_asn is the router's own AS. isPrePolicy / isAdjRibIn are `1` / `0`, the same as Adj-RIB-Out pre-policy lines,
   so those two fields cannot tell them apart: use peer_ip `0.0.0.0`. The peer message has field 28 isLocRIB = 1.
+- (0.4.0+) **Per-family Peer Ups of the same Loc-RIB** (RFC 9069 6.1.1: several emulated peers with the same distinguisher / BGP ID, e.g. Junos inet.0 = IPv4, inet6.0 = IPv6):
+  one peer `up` message per Peer Up (same peer hash, info_data of that Peer Up), and the routes stay one peer (a later Peer Up does not clear the other family).
+  0.3 treated the second Peer Up as a new session and cleared the table. A peer `down` covers the whole Loc-RIB (BMP does not say which family).
+- Junos Loc-RIB sends an IPv6 End-of-RIB but **no IPv4 End-of-RIB**, so that peer stays `synced: false` in the API / `-status` (bongsudae does not count an End-of-RIB the router never sent). Kafka rows and routing tables are not affected.
 - **No del lines are sent when a peer goes down.** On a peer `down` (or a router `term`, section 5) the consumer must remove all
   routes of that peer itself (same as openbmpd).
 - AS4_PATH is merged into AS_PATH when the session uses 2-byte AS numbers (RFC 6793).
@@ -246,7 +256,7 @@ Following the OpenBMP schema (https://www.openbmp.org/api/kafka_message_schema.h
 - The OpenBMP schema has no route type field (1 Ethernet A-D, 2 MAC/IP, 3 Inclusive Multicast, 4 Ethernet Segment, 5 IP Prefix); in TSV it shows from the filled fields. Unknown types (6+) are skipped.
 - Row hash: md5(peer hash + MAC + MAC length + IP + IP length + ESI + RD + route type + [path ID] + [1 if labels]) as in the schema.
 - JSON: the same names in snake_case plus `route_type` and, for type 5, `gateway_ip`; empty fields are omitted.
-- No route tables for EVPN yet (Kafka rows only).
+- No routing tables for EVPN yet (Kafka rows only).
 
 ### 3.4 flowspec (0.3.0+, Bongsudae's own format: not in the OpenBMP schema)
 
@@ -295,7 +305,138 @@ The OpenBMP schema has no FlowSpec topic, so Bongsudae defines one, laid out lik
 - Row hash (field 2): md5(isIPv4 1 byte + RD 8 bytes + rule NLRI bytes + peer hash + [path ID]) = the same rule gets the same hash
 - A rule with an unknown component type (outside RFC 8955 / 8956) is dropped alone (each rule has its own length, so the next one is still read) and counted in the stat line `other_families:` under its family (e.g. `ipv4-flowspec`)
 - JSON: the same names in snake_case; empty fields are omitted; traffic_rate / traffic_marking / path_id are numbers, the rest are strings (rule and components as above)
-- Route table: only when `bmp.rib` lists `ipv4-flowspec` etc. Key = (RD, rule bytes). API list `family=ipv4-flowspec` (rule order); prefix lookup matches rules whose dst_prefix overlaps the prefix
+- Routing table: only when `bmp.rib` lists `ipv4-flowspec` etc. Key = (RD, rule bytes). API list `family=ipv4-flowspec` (rule order); prefix lookup matches rules whose dst_prefix overlaps the prefix
+
+### 3.5 Address families added in 0.4.0: common rules
+
+From 0.4.0 **every address family received over BMP is sent to Kafka** (nothing is dropped). These families have no routing table (Kafka rows only; listing one in `bmp.rib` logs one line at start).
+
+| Family (AFI/SAFI) | Topic | Fields | Section |
+|---|---|---|---|
+| BGP-LS (16388/71), BGP-LS VPN (16388/72), BGP-LS-SPF (16388/80) | `ls_node`, `ls_link`, `ls_prefix` | OpenBMP schema 27 / 46 / 34 fields + rd at the end | 3.6 |
+| VPLS (25/65) | `l2vpn_vpls` | Bongsudae's own, 29 fields | 3.7 |
+| MCAST-VPN (1, 2/5) | `mvpn` | Bongsudae's own, 31 fields | 3.8 |
+| SR Policy (1, 2/73) | `sr_policy` | Bongsudae's own, 32 fields | 3.9 |
+| RT Constraint (1/132) | `rt_constraint` | Bongsudae's own, 26 fields | 3.10 |
+| Everything else (MDT, Classful Transport, VPN multicast, CAR, MUP, Encap, Tunnel, unknown families) | `other_family` | Bongsudae's own, 32 fields | 3.11 |
+
+- Topic prefix as for other topics (`openbmp.parsed.`), key = peer hash, topic created on the first row, forwarding rules (unicast_prefix only) do not apply
+- Layout of Bongsudae's own topics = **10 leading fields + NLRI fields + 13 trailing fields** (as flowspec):
+  - leading 0 - 9: action, seq, hash, router_hash, router_ip, base_attr_hash, peer_hash, peer_ip, peer_asn, timestamp (as unicast_prefix 0 - 9)
+  - trailing 13: origin, as_path, as_path_count, origin_as, nexthop, med, local_pref, community_list, ext_community_list, large_community_list, path_id, isPrePolicy, isAdjRibIn
+- del rows: base_attr_hash and attribute fields are empty; NLRI fields are filled (what was withdrawn)
+- Row hash: md5(peer hash + topic name + NLRI bytes + [path ID]). BGP-LS nodes: see 3.6
+- JSON: same names (snake_case). Empty NLRI fields are left out, fields marked `#` are numbers, isPrePolicy / isAdjRibIn / is_ipv4 are true / false
+- Routes whose shape is unknown (unknown family, unknown MVPN / BGP-LS route type, unknown VPLS length) go to `other_family` as NLRI hex and are counted per family in the stat line `other_families:` (up to 0.3 they were counted and dropped)
+
+### 3.6 ls_node / ls_link / ls_prefix (BGP-LS, OpenBMP schema)
+
+Field order of the OpenBMP schema (https://www.openbmp.org/api/kafka_message_schema.html, BGP-LS fields of version 1.4) + **one rd field at the end** (RD of BGP-LS VPN = 16388/72, otherwise empty).
+Attribute fields come from the BGP-LS attribute (path attribute 29, RFC 9552), add rows only.
+
+**ls_node, 28 fields**: 0 action, 1 seq, 2 hash, 3 base_attr_hash, 4 router_hash, 5 router_ip, 6 peer_hash, 7 peer_ip, 8 peer_asn, 9 timestamp,
+10 igp_router_id, 11 router_id, 12 routing_id, 13 ls_id, 14 mt_id, 15 ospf_area_id, 16 isis_area_id, 17 protocol, 18 flags,
+19 as_path, 20 local_pref, 21 med, 22 nexthop, 23 name, 24 isPrePolicy, 25 isAdjRibIn, 26 sr_capabilities, 27 rd
+
+**ls_link, 47 fields**: 0 - 9 (as above), 10 igp_router_id, 11 router_id, 12 routing_id, 13 ls_id, 14 ospf_area_id, 15 isis_area_id, 16 protocol,
+17 as_path, 18 local_pref, 19 med, 20 nexthop, 21 mt_id, 22 local_link_id, 23 remote_link_id, 24 interface_ip, 25 neighbor_ip,
+26 igp_metric, 27 admin_group, 28 max_link_bw, 29 max_resv_bw, 30 unreserved_bw, 31 te_default_metric, 32 link_protection, 33 mpls_proto_mask,
+34 srlg, 35 link_name, 36 remote_node_hash, 37 local_node_hash, 38 remote_igp_router_id, 39 remote_router_id, 40 local_node_asn, 41 remote_node_asn,
+42 peer_node_sid, 43 isPrePolicy, 44 isAdjRibIn, 45 adj_segment_id, 46 rd
+
+**ls_prefix, 35 fields**: 0 - 9 (as above), 10 igp_router_id, 11 router_id, 12 routing_id, 13 ls_id, 14 ospf_area_id, 15 isis_area_id, 16 protocol,
+17 as_path, 18 local_pref, 19 med, 20 nexthop, 21 local_node_hash, 22 mt_id, 23 ospf_route_type, 24 igp_flags, 25 route_tag, 26 ext_route_tag,
+27 ospf_fwd_addr, 28 igp_metric, 29 prefix, 30 prefix_len, 31 isPrePolicy, 32 isAdjRibIn, 33 prefix_sid, 34 rd
+
+| Field | Value / source |
+|---|---|
+| protocol | NLRI protocol-ID: `IS-IS_L1` `IS-IS_L2` `OSPFv2` `Direct` `Static` `OSPFv3` `BGP` (EPE) `RSVP-TE` `Segment-Routing` |
+| routing_id | NLRI identifier (8 bytes, decimal) |
+| igp_router_id | node descriptor 515: OSPF `192.0.2.1`, IS-IS `0000.0000.0001`, pseudonode `0000.0000.0001.01`, OSPF DR `addr:addr` |
+| router_id | node descriptor 516 (BGP router ID, EPE) or attribute 1028 / 1029 (local router ID) |
+| ls_id / ospf_area_id | node descriptor 513 (8 hex digits) / 514 (address form) |
+| local_node_asn / remote_node_asn | node descriptor 512 |
+| mt_id | NLRI TLV 263 (hex, comma separated) |
+| flags | attribute 1024: `O` overload `T` attached `E` external `B` ABR `R` router `V` v6 |
+| name / isis_area_id | attribute 1026 / 1027 (hex) |
+| sr_capabilities | attribute 1034: `<flags hex> <range> <first>, ...` (first = label value, index as `idx<N>`) |
+| local_link_id / remote_link_id, interface_ip / neighbor_ip | NLRI TLV 258, 259 / 260 (IPv6 261 / 262) |
+| igp_metric | link = attribute 1095, prefix = attribute 1155 |
+| admin_group, te_default_metric, srlg (hex, comma separated), link_name | attributes 1088, 1092, 1096, 1098 |
+| max_link_bw, max_resv_bw, unreserved_bw | attributes 1089, 1090, 1091: **Kbit/s** (OpenBMP unit; unreserved = 8 priorities, comma separated) |
+| link_protection / mpls_proto_mask | attribute 1093 (`ExtraTraffic,Unprotected,Shared,Dedicated1:1,Dedicated1+1,Enhanced`) / 1094 (`LDP,RSVP-TE`) |
+| adj_segment_id | attribute 1099: `<flags hex> <weight> <SID>`, comma separated (SID = label, `idx<N>` or SRv6 address) |
+| peer_node_sid | attribute 1101 (EPE): `[L ]<weight> <SID>` |
+| ospf_route_type | NLRI TLV 264: `Intra` `Inter` `Ext-1` `Ext-2` `NSSA-1` `NSSA-2` |
+| prefix / prefix_len | NLRI TLV 265 |
+| igp_flags, route_tag, ext_route_tag (hex), ospf_fwd_addr | attributes 1152 (`D` `N` `L` `P`), 1153, 1154, 1156 |
+| prefix_sid | attribute 1158: `<flags hex> <algorithm> <SID>` |
+
+- **hash**: ls_node = md5(peer hash + (protocol + identifier + RD + local node descriptor bytes)). local_node_hash / remote_node_hash of ls_link
+  and local_node_hash of ls_prefix use the same computation = **the same value as the ls_node hash** (to find the node of a link / prefix).
+  The hash of ls_link / ls_prefix rows is computed as in 3.5 (inputs differ from OpenBMP's)
+- As in OpenBMP there are no origin / community fields. JSON has the same fields only
+- Other NLRI types (e.g. SRv6 SID, type 6) go to `other_family` (nlri_type = type number)
+
+### 3.7 l2vpn_vpls (Bongsudae's own, 29 fields)
+
+NLRI fields 10 - 15: 10 rd, 11 ve_id (#), 12 ve_block_offset (#), 13 ve_block_size (#), 14 label_base (#), 15 pe_address. Then 16 - 28 = the 13 trailing fields of 3.5.
+
+- RFC 4761 (17-byte NLRI): rd, ve_id, ve_block_offset, ve_block_size, label_base (20-bit label value); pe_address empty
+- RFC 6074 BGP auto-discovery (12 bytes): rd and pe_address only
+- Other lengths: other_family (nlri_type `len=<N>`)
+
+### 3.8 mvpn (Bongsudae's own, 31 fields)
+
+NLRI fields 10 - 17: 10 is_ipv4, 11 route_type (#), 12 rd, 13 originating_router_ip, 14 source_as (#), 15 source, 16 group, 17 route_key. Then 18 - 30 = trailing 13 fields.
+
+| route_type (RFC 6514) | Fields filled |
+|---|---|
+| 1 Intra-AS I-PMSI A-D | rd, originating_router_ip |
+| 2 Inter-AS I-PMSI A-D | rd, source_as |
+| 3 S-PMSI A-D | rd, source, group, originating_router_ip |
+| 4 Leaf A-D | route_key, originating_router_ip |
+| 5 Source Active A-D | rd, source, group |
+| 6 Shared Tree Join / 7 Source Tree Join | rd, source_as, source (C-RP for 6), group |
+
+- Wildcard source / group (length 0, RFC 6625) = `*`
+- route_key (type 4) = the inner route as space separated `name=value` (e.g. `type=3 rd=64496:100 source=198.51.100.1 group=232.1.1.1 originating_router_ip=192.0.2.1`); a key that cannot be decoded is `type=<N> <hex>`
+- Types 8 and above: other_family
+
+### 3.9 sr_policy (Bongsudae's own, 32 fields)
+
+NLRI fields 10 - 18: 10 is_ipv4, 11 distinguisher (#), 12 color (#), 13 endpoint, 14 preference (#), 15 binding_sid, 16 policy_name, 17 candidate_path_name, 18 segment_lists. Then 19 - 31 = trailing 13 fields.
+
+- 10 - 13 = NLRI (RFC 9830 2.1). 14 - 18 = tunnel type 15 of the Tunnel Encapsulation attribute (path attribute 23, RFC 9012), add rows only:
+  preference = sub-TLV 12, binding_sid = 13 / 20 (label value or SRv6 address), candidate_path_name = 129, policy_name = 130
+- segment_lists = one `w=<weight> <segment> <segment> ...` per segment list (sub-TLV 128), joined with `; `. segment = type A label value, type B SRv6 SID, otherwise `type<N>`
+
+### 3.10 rt_constraint (Bongsudae's own, 26 fields)
+
+NLRI fields 10 - 12: 10 prefix_len (#, 0 or 32 - 96), 11 rt_origin_as (#), 12 route_target. Then 13 - 25 = trailing 13 fields.
+
+- route_target = extended community text (as in ext_community_list, e.g. `rt=64496:100`); shorter than 96 bits: `<hex>/<bits>`
+- prefix_len 0 = all route targets (default route); rt_origin_as / route_target empty
+
+### 3.11 other_family (Bongsudae's own, 32 fields)
+
+NLRI fields 10 - 18: 10 afi (#), 11 safi (#), 12 family (name, or `afi/safi`), 13 nlri_type, 14 rd, 15 prefix, 16 labels, 17 detail, 18 nlri. Then 19 - 31 = trailing 13 fields.
+
+- nlri = the route's NLRI bytes in hex (always filled). Other fields only for families that can be decoded:
+
+| Family (AFI/SAFI) | family | Fields filled |
+|---|---|---|
+| 1, 2/7 Encapsulation (RFC 5512) | ipv4-encap / ipv6-encap | prefix (endpoint) |
+| 1, 2/64 Tunnel | ipv4-tunnel / ipv6-tunnel | prefix, detail `tunnel_id=<N>` |
+| 1/66 MDT (RFC 6037) | ipv4-mdt | rd, prefix (source address /32), detail `group=<address>` |
+| 1, 2/76 Classful Transport (RFC 9832) | ipv4/ipv6-classful-transport | labels, rd, prefix |
+| 1, 2/129 VPN multicast (RFC 6513) | ipv4/ipv6-vpn-multicast | labels, rd, prefix |
+| 1, 2/83 CAR, 84 VPN-CAR | ipv4/ipv6-car, -vpn-car | nlri_type, (type 1) rd, prefix, detail `color=<N>` |
+| 1, 2/85 MUP | ipv4/ipv6-mup | nlri_type `<architecture>/<route type>`, rd |
+| Route type unknown to another parser | that family (bgp-ls, ipv4-mvpn, ...) | nlri_type |
+| Family not in the registry | `afi/safi` | nlri = the whole NLRI of the MP_REACH / UNREACH (routes cannot be split) |
+
+- Unregistered families and unknown route types are also counted in the stat line `other_families:`
 
 ## 4. peer (31 fields)
 
@@ -317,7 +458,7 @@ The OpenBMP schema has no FlowSpec topic, so Bongsudae defines one, laid out lik
 | 13 | local_ip | `198.51.100.98` | up only |
 | 14 | local_port | `30719` | up only |
 | 15 | local_bgp_id | `192.0.2.100` | up only (from the router's OPEN) |
-| 16 | info_data | | always empty |
+| 16 | info_data | `core view` | (0.4.0~) up only: Peer Up information TLV 0 (free text from the router; several are joined with a space). Empty if none |
 | 17 | adv_cap | `MPBGP (1) : afi=1 safi=1 : Unicast IPv4, Route Refresh (2), ...` | capabilities in the OPEN sent by the router (up only), `, ` separated |
 | 18 | recv_cap | `Graceful Restart (64), MPBGP (1) : ...` | capabilities in the OPEN received from the peer (up only) |
 | 19 | remote_holddown | `90` | hold time in the peer's OPEN (up only) |
@@ -331,7 +472,7 @@ The OpenBMP schema has no FlowSpec topic, so Bongsudae defines one, laid out lik
 | 27 | isIPv4 | `1` | address family of the peer address |
 | 28 | isLocRIB | `0` | 1 if the peer type is Loc-RIB (3) |
 | 29 | isLocRIBFiltered | `0` | 1 if Loc-RIB and the F flag (0x80) is set |
-| 30 | table_name | | always empty |
+| 30 | table_name | `global` | (0.4.0~) Peer Up information TLV 3 (VRF / Table Name; optional per RFC 9069 5.2.1, `global` for the default table). Both up and down (down carries the name of that session). Junos sends no TLV 3 and puts the table name (`inet.0` / `inet6.0`) in TLV 0 = info_data (allowed by RFC 9736). Empty if none |
 
 error_text (down):
 

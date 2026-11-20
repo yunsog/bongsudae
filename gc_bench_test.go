@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 package main
 
 import (
@@ -37,7 +39,7 @@ func BenchmarkProcess(b *testing.B) {
 	}
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		c := newCollector(msgs[0].cHash)
+		c := ribCollector(msgs[0].cHash)
 		for j, m := range msgs {
 			c.handle(m.routerIP, m.routerHash, m.body, ts[j])
 		}

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 // 퍼징 (0.2.0) : 망가뜨린 BMP 입력을 수백만 번 넣어 panic (코드 실수) 을 찾음.
 //
 //	go test -run '^$' -fuzz FuzzProcess -fuzztime 10m .   (보통 go test 는 아래 씨앗만 한 번씩 돌림)
@@ -85,7 +87,7 @@ func FuzzProcess(f *testing.F) {
 	now := time.Unix(1793160000, 0)
 	f.Fuzz(func(t *testing.T, in []byte) {
 		for _, buckets := range []int{0, 8} {
-			c := newCollector("x")
+			c := ribCollector("x")
 			c.keyBuckets = buckets
 			r := c.lockRouter("192.0.2.1", "")
 			rd := newMsgReader(bytes.NewReader(nil), in) // 수집기가 TCP 에서 자르는 것과 같은 코드
@@ -108,5 +110,38 @@ func FuzzExtComm(f *testing.F) {
 	f.Add([]byte{6, 0, 1, 0, 0, 0, 0, 5})
 	f.Fuzz(func(t *testing.T, b []byte) {
 		extCommString(b)
+	})
+}
+
+// FuzzXFamilies : 0.4.0 종류 (xroute.go) 의 해석기와 줄 만들기. 입력을 NLRI, BGP-LS 속성, Tunnel Encap 으로 모두 넣어 봄
+func FuzzXFamilies(f *testing.F) {
+	f.Add([]byte{0, 1, 0, 13, 2, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0})
+	f.Add([]byte{0, 0x11, 0, 0, 0xfb, 0xf0, 0, 0, 0, 0x64, 0, 1, 0, 1, 0, 0x0a, 0, 0x3e, 0x81})
+	f.Add([]byte{3, 10, 0, 0, 0xfb, 0xf0, 0, 0, 0, 0x64, 0x20, 1})
+	f.Add([]byte{0x60, 0, 0, 0, 1, 0, 0, 0, 0x64, 0xc0, 0, 2, 2})
+	fams := []family{famOf(16388, 71), famOf(16388, 72), famOf(16388, 80), famOf(25, 65), famOf(1, 5), famOf(2, 5),
+		famOf(1, 73), famOf(2, 73), famOf(1, 132), famOf(1, 7), famOf(2, 64), famOf(1, 66), famOf(1, 76), famOf(2, 129),
+		famOf(1, 83), famOf(2, 84), famOf(1, 85), famOf(99, 9)}
+	f.Fuzz(func(t *testing.T, in []byte) {
+		c, r, rp := famTestPeer()
+		for _, fm := range fams {
+			ps, ok := nlriParsers[fm]
+			if !ok {
+				ps = rawParser(fm)
+			}
+			for _, ap := range []bool{false, true} {
+				u := &update{lsAttr: in, tunEncap: in}
+				o := pathOpts{}
+				if ap {
+					o.addPaths = []family{fm}
+				}
+				_ = ps.reach(u, in, in, o)
+				_ = ps.unreach(u, in, o)
+				for _, js := range []bool{false, true} {
+					c.json = js
+					c.famMsgs(r, rp, u, nil)
+				}
+			}
+		}
 	})
 }

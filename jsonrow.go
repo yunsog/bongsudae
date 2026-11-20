@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 // jsonrow.go : JSON 출력 (0.2.0, -format json / 설정 kafka.format = json)
 //
 // 토픽, Kafka key, 메시지 나누기 (UPDATE 하나 = add 메시지 + del 메시지, key_buckets) 는 openbmp 꼴과 같고

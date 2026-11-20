@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 package main
 
 import (
@@ -29,7 +31,7 @@ func vpnUpdate(t *testing.T, rdn uint32, pfx string, label uint32, del bool) *up
 }
 
 func vpnCollector(rib string) (*collector, *router, *peer) {
-	c := newCollector("x")
+	c := ribCollector("x")
 	fams, _ := parseRIBFamilies(rib)
 	c.setRIB(fams)
 	r := c.routerFor("192.0.2.1", "")
@@ -38,7 +40,7 @@ func vpnCollector(rib string) (*collector, *router, *peer) {
 	return c, r, p
 }
 
-// VPNv4 경로표 : 같은 프리픽스도 RD 가 다르면 따로, 철회는 그 RD 만, 라벨은 속성에. 기본 (vpnv4 꺼짐) 이면 넣지 않음
+// VPNv4 라우팅 테이블 : 같은 프리픽스도 RD 가 다르면 따로, 철회는 그 RD 만, 라벨은 속성에. 기본 (vpnv4 꺼짐) 이면 넣지 않음
 func TestFamRIB(t *testing.T) {
 	c, r, p := vpnCollector("ipv4-unicast,ipv6-unicast")
 	p.apply(viewInPre, vpnUpdate(t, 1, "203.0.113.0/24", 17, false), testNow, c.on)

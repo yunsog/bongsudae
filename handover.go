@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 // 무중단 판 올리기 (0.2.0) : 라우터 연결과 상태를 그대로 새 실행 파일에 넘김 -> 라우터가 다시 붙지 않음
 // (전에는 판을 올릴 때마다 라우터가 전체 경로를 다시 보냄 = 약 18 분 + 소비자 지연). 설계 docs/design_handover.md
 //
@@ -9,14 +11,14 @@
 //	    -> 연결 goroutine 은 메시지 경계에서 park (읽다 만 바이트는 msgReader 에 남음)
 //	 3. Kafka 에 남은 것을 다 보냄 (Flush)
 //	 4. fd 복사 (dup = CLOEXEC 없음 : exec 뒤에도 열림) : listener, 연결, API listener, 잠금 파일
-//	 5. 상태 파일 : 머리 + gob (라우터 / peer / seq / 연결) + 경로표 (state_rib.go)
+//	 5. 상태 파일 : 머리 + gob (라우터 / peer / seq / 연결) + 라우팅 테이블 (state_rib.go)
 //	 6. syscall.Exec  ------------------------------------>  7. gob 을 읽어 collector 를 다시 만듦, fd 로 연결을 다시 잡음
 //	                                                          8. 연결마다 남은 바이트부터 이어 읽음 (= 라우터 멈춤 끝)
-//	                                                          9. 경로표는 뒤에서 읽음 (그동안 온 UPDATE 는 peer 마다 모았다가 적용)
+//	                                                          9. 라우팅 테이블은 뒤에서 읽음 (그동안 온 UPDATE 는 peer 마다 모았다가 적용)
 //
 // 실패하면 : 1 ~ 6 (exec 실패 포함) 은 멈춘 연결을 그대로 이어 읽음 (옛 판이 계속, 기록 + /api/stats 의 last_error).
 // exec 뒤 새 판이 상태를 못 읽으면 끝남 -> 연결이 끊겨 라우터가 다시 붙음 = 지금까지의 재시작과 같음 (더 나빠지지 않음).
-// Kafka 출력은 경로표와 상관없으므로 9 를 기다리지 않음 (경로 수 / 찾기 API 만 그동안 덜 나옴 : rib_loading).
+// Kafka 출력은 라우팅 테이블과 상관없으므로 9 를 기다리지 않음 (경로 수 / 찾기 API 만 그동안 덜 나옴 : rib_loading).
 package main
 
 import (
@@ -44,7 +46,7 @@ import (
 
 const (
 	stateMagic   = "bongsudae-handover\n" // 상태 파일 첫 줄
-	stateVersion = 2                      // 이 판이 쓰는 상태 파일 형식 판 : 칸을 바꾸면 올림 (1 = 0.2, 2 = 0.3 보기마다 경로표)
+	stateVersion = 2                      // 이 판이 쓰는 상태 파일 형식 판 : 칸을 바꾸면 올림 (1 = 0.2, 2 = 0.3 보기마다 라우팅 테이블)
 	stateOldest  = 1                      // 이 판이 읽는 가장 옛 형식 (0.2 -> 0.3 도 무중단)
 	pauseWait    = 10 * time.Second       // 연결이 모두 멈추기를 기다리는 시간 (넘으면 그만두고 이어 읽음)
 	flushWait    = 20 * time.Second       // Kafka 에 남은 것을 보내는 시간
@@ -54,7 +56,7 @@ const (
 // exePath : 시작 때의 실행 파일 경로 (판을 올릴 때는 같은 경로의 새 파일을 exec)
 var exePath string
 
-// ribLoading : 판 올리기 뒤 경로표를 뒤에서 읽는 중 (/api/stats 에 보임)
+// ribLoading : 판 올리기 뒤 라우팅 테이블을 뒤에서 읽는 중 (/api/stats 에 보임)
 var ribLoading atomic.Bool
 
 // ---- 옛 판 : 멈추기 ----
@@ -248,7 +250,7 @@ func (u *upgrader) upgrade() {
 		u.fail(errors.New("not ready (tcp input not started)"))
 		return
 	}
-	if ribLoading.Load() { // 지난 판 올리기의 경로표를 아직 읽는 중 : 지금 넘기면 덜 읽은 경로표를 넘김
+	if ribLoading.Load() { // 지난 판 올리기의 라우팅 테이블을 아직 읽는 중 : 지금 넘기면 덜 읽은 라우팅 테이블을 넘김
 		u.fail(errors.New("route tables of the last handover are still loading, try again in a minute"))
 		return
 	}
@@ -445,7 +447,7 @@ func clearCloexec(fd int) error {
 
 // ---- 상태 파일 ----
 
-// handoverState : 상태 파일의 gob 부분 (gob 은 대문자 칸만 씀). 경로표는 뒤에 따로 (state_rib.go, Routers / Peers 순서)
+// handoverState : 상태 파일의 gob 부분 (gob 은 대문자 칸만 씀). 라우팅 테이블은 뒤에 따로 (state_rib.go, Routers / Peers 순서)
 type handoverState struct {
 	Version      int
 	Release, Rev string    // 옛 판
@@ -465,7 +467,7 @@ type handoverState struct {
 	// 새 판에서만 (gob 에 안 들어감)
 	f     *os.File
 	rd    *bufio.Reader
-	peers []*peer   // 경로표 덩어리 순서
+	peers []*peer   // 라우팅 테이블 덩어리 순서
 	owner []*router // peers[i] 의 라우터
 }
 
@@ -497,7 +499,7 @@ type routerState struct {
 	Peers              []peerState
 }
 
-// peerState : peer 의 칸 (경로표 rib4 / rib6 은 state_rib.go)
+// peerState : peer 의 칸 (라우팅 테이블 rib4 / rib6 은 state_rib.go)
 type peerState struct {
 	Key                  string
 	IP                   netip.Addr
@@ -514,6 +516,7 @@ type peerState struct {
 	LocalPort, RmtPort   uint16
 	HoldSent, HoldRecv   uint16
 	SentCaps, RecvCaps   string
+	InfoData, TableName  string // 0.4.0 (gob : 0.3 에서 넘겨받으면 다음 Peer Up 까지 빈칸, 0.3 으로 되돌리면 버림)
 	AddPathV4, AddPathV6 bool
 	FamV4, FamV6         bool
 	Fams, AddPathFams    []family  // 0.3.0 (형식 1 에는 없음 : 0.2 에서 넘겨받으면 다음 Peer Up 까지 빈칸)
@@ -525,7 +528,7 @@ type peerState struct {
 	Views                []viewState // 형식 2 (0.3.0) : 받은 보기마다
 }
 
-// viewState : 보기 하나의 수와 시각 (경로표는 state_rib.go)
+// viewState : 보기 하나의 수와 시각 (라우팅 테이블은 state_rib.go)
 type viewState struct {
 	View         int
 	EorV4, EorV6 time.Time
@@ -560,7 +563,7 @@ func savePeer(p *peer, format int) peerState {
 	s := peerState{Key: p.key, IP: p.ip, IPStr: p.ipStr, RD: p.rd, Typ: p.typ, Flags: p.flags, AS: p.as, BgpID: p.bgpID, BgpIDRaw: p.bgpIDRaw,
 		BmpStats: p.bmpStats, BmpStatsAt: p.bmpStatsAt, Up: p.up, GotUp: p.gotUp, NoOpen: p.noOpen, Since: p.since,
 		LocalIP: p.localIP, LocalPort: p.localPort, RmtPort: p.rmtPort, HoldSent: p.holdSent, HoldRecv: p.holdRecv,
-		SentCaps: p.sentCaps, RecvCaps: p.recvCaps, AddPathV4: p.addPathV4, AddPathV6: p.addPathV6, FamV4: p.famV4, FamV6: p.famV6,
+		SentCaps: p.sentCaps, RecvCaps: p.recvCaps, InfoData: p.infoData, TableName: p.tableName, AddPathV4: p.addPathV4, AddPathV6: p.addPathV6, FamV4: p.famV4, FamV6: p.famV6,
 		DownReason: p.downReason, Fams: p.fams, AddPathFams: p.addPathFams}
 	mv := p.view(-1)
 	s.EorV4, s.EorV6, s.LastUpdate, s.Adds, s.Dels = mv.eorV4, mv.eorV6, mv.lastUpdate, mv.adds, mv.dels
@@ -578,12 +581,12 @@ func savePeer(p *peer, format int) peerState {
 	return s
 }
 
-// load : 상태 파일 (format) 의 peer -> peer (경로표는 비어 있음 : loadRIBs)
+// load : 상태 파일 (format) 의 peer -> peer (라우팅 테이블은 비어 있음 : loadRIBs)
 func (s *peerState) load(format int) *peer {
 	p := &peer{key: s.Key, ip: s.IP, ipStr: s.IPStr, rd: s.RD, typ: s.Typ, flags: s.Flags, as: s.AS, bgpID: s.BgpID, bgpIDRaw: s.BgpIDRaw,
 		bmpStats: s.BmpStats, bmpStatsAt: s.BmpStatsAt, up: s.Up, gotUp: s.GotUp, noOpen: s.NoOpen, since: s.Since,
 		localIP: s.LocalIP, localPort: s.LocalPort, rmtPort: s.RmtPort, holdSent: s.HoldSent, holdRecv: s.HoldRecv,
-		sentCaps: s.SentCaps, recvCaps: s.RecvCaps, addPathV4: s.AddPathV4, addPathV6: s.AddPathV6, famV4: s.FamV4, famV6: s.FamV6,
+		sentCaps: s.SentCaps, recvCaps: s.RecvCaps, infoData: s.InfoData, tableName: s.TableName, addPathV4: s.AddPathV4, addPathV6: s.AddPathV6, famV4: s.FamV4, famV6: s.FamV6,
 		downReason: s.DownReason, fams: s.Fams, addPathFams: s.AddPathFams}
 	if format >= 2 {
 		for _, vs := range s.Views {
@@ -600,7 +603,7 @@ func (s *peerState) load(format int) *peer {
 	return p
 }
 
-// writeHandover : 상태 파일 = 머리 줄 + gob 길이 (8 바이트) + gob + 경로표 덩어리들.
+// writeHandover : 상태 파일 = 머리 줄 + gob 길이 (8 바이트) + gob + 라우팅 테이블 덩어리들.
 // 라우터 잠금 (읽기) 을 잡고 씀 : 연결 goroutine 은 멈춰 있고 API 는 읽기만 하므로 그 사이 바뀌지 않음
 func writeHandover(path string, hs *handoverState, c *collector) (size int64, routes int, err error) {
 	rs := c.sortedRouters()
@@ -677,7 +680,7 @@ func handoverFormats() {
 	fmt.Println()
 }
 
-// readHandover : -resume 의 상태 파일에서 gob 부분까지 읽음 (경로표는 loadRIBs 가 이어서)
+// readHandover : -resume 의 상태 파일에서 gob 부분까지 읽음 (라우팅 테이블은 loadRIBs 가 이어서)
 func readHandover(path string) (*handoverState, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -712,7 +715,7 @@ func readHandover(path string) (*handoverState, error) {
 	return hs, nil
 }
 
-// restore : 라우터 / peer / 줄 번호 / 통계를 collector 에. 경로표는 비어 있고 기다림 (loadRIBs)
+// restore : 라우터 / peer / 줄 번호 / 통계를 collector 에. 라우팅 테이블은 비어 있고 기다림 (loadRIBs)
 func (hs *handoverState) restore(c *collector) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -810,8 +813,8 @@ func (hs *handoverState) resumed() {
 		hs.Release, hs.Rev, len(hs.Conns), len(hs.Routers), len(hs.peers), pause.Round(time.Millisecond))
 }
 
-// loadRIBs : 경로표를 뒤에서 읽음 (go 로 부름). peer 마다 다 읽으면 잠금 안에서 넣고 미뤄 둔 UPDATE 를 적용 (rib.go ribLoaded).
-// 다 읽으면 상태 파일을 지움. 읽다 틀리면 아직 기다리는 peer 는 빈 경로표에서 이어 감 (기록 : 다음 전체 전송까지 경로 수가 모자람)
+// loadRIBs : 라우팅 테이블을 뒤에서 읽음 (go 로 부름). peer 마다 다 읽으면 잠금 안에서 넣고 미뤄 둔 UPDATE 를 적용 (rib.go ribLoaded).
+// 다 읽으면 상태 파일을 지움. 읽다 틀리면 아직 기다리는 peer 는 빈 라우팅 테이블에서 이어 감 (기록 : 다음 전체 전송까지 경로 수가 모자람)
 func (hs *handoverState) loadRIBs(c *collector) {
 	start := time.Now()
 	defer func() {
@@ -864,8 +867,8 @@ type handoverJSON struct {
 	LastAt      string `json:"last_at,omitempty"`       // 마지막 판 올리기 (새 판이 시작한 시각)
 	From        string `json:"from,omitempty"`          // 그때 옛 판 (판 번호, git rev)
 	PauseMs     int64  `json:"pause_ms,omitempty"`      // 라우터 읽기가 멈춘 시간
-	RIBLoading  bool   `json:"rib_loading"`             // 경로표를 뒤에서 읽는 중
-	RIBLoadMs   int64  `json:"rib_load_ms,omitempty"`   // 경로표 읽기에 걸린 시간
+	RIBLoading  bool   `json:"rib_loading"`             // 라우팅 테이블을 뒤에서 읽는 중
+	RIBLoadMs   int64  `json:"rib_load_ms,omitempty"`   // 라우팅 테이블 읽기에 걸린 시간
 	LastError   string `json:"last_error,omitempty"`    // 마지막으로 그만둔 이유 (옛 판이 계속)
 	LastErrorAt string `json:"last_error_at,omitempty"` // 그 시각
 }

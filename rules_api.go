@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 // 웹 API : Kafka 전달 규칙 (rules.go). 조회는 누구나, 바꾸기는 key (X-API-Key = -token 파일 내용) 가 맞아야 함
 //
 //	GET    /api/kafka/rules                                 규칙 전체 + 토픽별 지난 1 분 수

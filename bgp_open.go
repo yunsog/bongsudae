@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 // Peer Up 의 BGP OPEN 해석 : AS, hold time, BGP ID, 능력 (4 바이트 AS, Add-Path, 글자 목록)
 package main
 

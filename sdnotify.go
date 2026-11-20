@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 // sdnotify.go : systemd 알림 (0.2.0). 라이브러리 없이 NOTIFY_SOCKET (unixgram 소켓) 에 "키=값" 한 줄을 씀
 //
 // watchdog : 단위 파일 WatchdogSec=180 + NotifyAccess=main 이면, 1 분 통계 (logStat : 모든 라우터 잠금을 차례로 잡음) 가

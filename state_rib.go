@@ -1,4 +1,6 @@
-// 무중단 판 올리기 (0.2.0) 의 상태 파일 중 경로표 부분 : peer 경로표를 바이트로 쓰고 / 다시 만듦
+// SPDX-License-Identifier: Apache-2.0
+
+// 무중단 판 올리기 (0.2.0) 의 상태 파일 중 라우팅 테이블 부분 : peer 라우팅 테이블을 바이트로 쓰고 / 다시 만듦
 //
 // peer 마다 한 덩어리 (속성 표 + 경로들). 덩어리끼리는 서로 모르므로 여러 코어가 나눠 만들고 / 읽음.
 // 파일에는 peer 순서대로 (읽는 쪽도 같은 순서의 peer 목록을 가짐 : 상태 파일의 peer 부분).
@@ -30,7 +32,7 @@ import (
 
 // ---- 쓰기 ----
 
-// encodeRIB : peer 하나의 경로표 (보기들) -> 덩어리 내용 (format 1 = 주 보기 하나, 2 = 보기마다)
+// encodeRIB : peer 하나의 라우팅 테이블 (보기들) -> 덩어리 내용 (format 1 = 주 보기 하나, 2 = 보기마다)
 func (p *peer) encodeRIB(format int) []byte {
 	idx := map[unique.Handle[pathAttr]]uint64{} // 속성 -> 이 덩어리의 번호
 	var attrs []unique.Handle[pathAttr]
@@ -146,7 +148,7 @@ func appendAttr(b []byte, a pathAttr, format int) []byte {
 	return b
 }
 
-// writeRIBs : peer 들의 경로표를 차례로 씀. 덩어리는 여러 goroutine 이 미리 만들고, 쓰기는 순서대로 하나씩.
+// writeRIBs : peer 들의 라우팅 테이블을 차례로 씀. 덩어리는 여러 goroutine 이 미리 만들고, 쓰기는 순서대로 하나씩.
 // 돌려주는 것 = 쓴 바이트 수
 func writeRIBs(w io.Writer, ps []*peer, format int) (int64, error) {
 	outs := make([]chan []byte, len(ps)) // peer i 의 덩어리가 오는 곳
@@ -265,7 +267,7 @@ func (d *dec) attr(format int) pathAttr {
 	return a
 }
 
-// decodeRIB : 덩어리 내용 -> 보기마다 경로표 (nil = 그 보기 없음) 와 경로 수.
+// decodeRIB : 덩어리 내용 -> 보기마다 라우팅 테이블 (nil = 그 보기 없음) 와 경로 수.
 // 형식 1 의 표 하나는 보기 defView (그 peer 의 마지막 per-peer 머리 보기)
 func decodeRIB(b []byte, format, defView int) ([nViews]*ribView, int, error) {
 	var tabs [nViews]*ribView
@@ -371,7 +373,7 @@ func decodeRIB(b []byte, format, defView int) ([nViews]*ribView, int, error) {
 }
 
 // readRIBs : writeRIBs 가 쓴 덩어리 n 개를 읽음. 읽기는 하나씩, 덩어리마다 fn(번호, 내용) 은 여러 goroutine 이 부름
-// (fn 이 경로표를 다시 만들고 넣음 : 간단히는 ps[i].decodeRIB, 판 올리기는 handover.go loadRIBs)
+// (fn 이 라우팅 테이블을 다시 만들고 넣음 : 간단히는 ps[i].decodeRIB, 판 올리기는 handover.go loadRIBs)
 func readRIBs(r io.Reader, n int, fn func(i int, b []byte) error) error {
 	type job struct {
 		i int

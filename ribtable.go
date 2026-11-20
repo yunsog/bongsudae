@@ -1,4 +1,6 @@
-// ribtable.go : 경로표 한 장 (0.3.0). 경로 종류 / 보기가 늘어도 표를 다루는 코드는 이것 하나 (Go 제네릭 = C++ 템플릿).
+// SPDX-License-Identifier: Apache-2.0
+
+// ribtable.go : 라우팅 테이블 한 장 (0.3.0). 경로 종류 / 보기가 늘어도 표를 다루는 코드는 이것 하나 (Go 제네릭 = C++ 템플릿).
 //
 // 열쇠 (K) 만 경로 종류마다 다름 : key4 (IPv4 프리픽스), key6 (IPv6), 나중에 VPN 은 RD + 프리픽스 등.
 // 열쇠를 종류마다 꼭 필요한 크기로 두어 메모리가 늘지 않게 함 (공용 큰 열쇠면 7,700 만 경로에 1.5 ~ 2 GB 더 듦).
@@ -23,7 +25,7 @@ import (
 	"net/netip"
 )
 
-// ribKey : 경로표 열쇠가 할 줄 알아야 하는 것
+// ribKey : 라우팅 테이블 열쇠가 할 줄 알아야 하는 것
 type ribKey interface {
 	comparable
 	prefix() netip.Prefix // 출력 / 찾기용 프리픽스

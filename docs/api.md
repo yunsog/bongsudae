@@ -1,7 +1,7 @@
 # Bongsudae HTTP API
 
 The HTTP API served by Bongsudae, a BMP (RFC 7854) collector.
-It shows the state of routers and peers, lets you search the per-peer route tables
+It shows the state of routers and peers, lets you search the per-peer routing tables
 the collector keeps in memory, and manages the Kafka forwarding rules.
 
 The running collector serves this document itself at `GET /api/doc`
@@ -15,7 +15,7 @@ The running collector serves this document itself at `GET /api/doc`
 - Times: RFC 3339 in the server's local time zone, e.g. `2026-10-29T14:52:36+09:00`. Missing times are `""`.
 - Addresses: IPv4 `192.0.2.20`, IPv6 in canonical form `2001:db8::20:63`. Put them in the path as they are
   (`:` does not need escaping).
-- Concurrency: at most 4 requests that scan route tables (`.../prefixes` lists, `.../prefix` search) and 16 others
+- Concurrency: at most 4 requests that scan routing tables (`.../prefixes` lists, `.../prefix` search) and 16 others
   (status, stats, /metrics, rules, reset) run at once. A request that cannot get a slot within 5 seconds gets **503**
   with `Retry-After: 5`. Large lists can take a few seconds.
 - Timeouts: the request (headers and body) must arrive within 30 seconds. The response keeps going as long as the client
@@ -124,10 +124,10 @@ last 60 minutes, plus release, memory and Kafka state. History is lost when the 
 | counts | BMP type counts (`route_mon`, `peer_up`, ...) are omitted when zero; the other keys are always present |
 | raw | Messages sent to the bmp_raw topic in that minute (tcp input only) |
 | counts.family_rows | (0.3.0+) address family rows (labeled_unicast_prefix, l3vpn, multicast_prefix, evpn, flowspec) produced in that minute |
-| other_families | (0.3.0+, omitted when none) MP_REACH / MP_UNREACH dropped per address family that is not parsed, e.g. `{"bgp-ls": 12, "rt-constraint": 3}` (a split of counts.others) |
+| other_families | (0.3.0+, omitted when none) routes of unknown shape sent only as NLRI hex, per address family, e.g. `{"99/9": 12, "bgp-ls": 3}` (a split of counts.others). From 0.4.0 these routes go to the Kafka other_family topic (0.3 counted MP_REACH / UNREACH and dropped them) |
 | kafka_fail_total | Produce failures since start, as of that minute |
 | topics | Messages / rows per unicast_prefix topic (forwarding rules): `{"msgs": N, "rows": N}` (0.1 used the keys `Msgs` / `Rows`) |
-| handover | (0.2.0+, tcp input only = this release can do a hitless upgrade; missing = 0.1, `-upgrade` will not work) supported, count (upgrades since the last restart), last_at / from (time of the last upgrade and the release it came from), pause_ms (how long reading from routers was paused), rib_loading (route tables still loading in the background: route counts / lookups are incomplete), rib_load_ms, last_error / last_error_at (why the last attempt gave up; the old process kept running). `bongsudae -upgrade` reads this |
+| handover | (0.2.0+, tcp input only = this release can do a hitless upgrade; missing = 0.1, `-upgrade` will not work) supported, count (upgrades since the last restart), last_at / from (time of the last upgrade and the release it came from), pause_ms (how long reading from routers was paused), rib_loading (routing tables still loading in the background: route counts / lookups are incomplete), rib_load_ms, last_error / last_error_at (why the last attempt gave up; the old process kept running). `bongsudae -upgrade` reads this |
 | by_router | (0.2.0+, only with `?by_router=1`) router address -> counts in the same form, only for routers that had messages or errors in that minute |
 
 What to watch: whether `counts.errors` or `kafka.fails_total` grows, whether `kafka.last_ok` has stopped for
@@ -150,18 +150,19 @@ Scrape config example: `scrape_configs: [{job_name: bongsudae, static_configs: [
 | bongsudae_router_errors_total | counter | router | messages that could not be parsed |
 | bongsudae_router_peer_up_no_open_total | counter | router | Peer Up messages without the OPENs |
 | bongsudae_peers | gauge | router, state | state = `up` / `down` / `synced` / `settled` |
-| bongsudae_routes | gauge | router, afi | prefixes in the route tables (`4` / `6`) |
+| bongsudae_routes | gauge | router, afi | prefixes in the routing tables (`4` / `6`) |
 | bongsudae_rows_total | counter | action | unicast_prefix rows (`add` / `del`) |
 | bongsudae_rows_not_sent_total | counter | | rows not sent because of forwarding rules |
 | bongsudae_kafka_messages_total | counter | kind | produced messages (`unicast_prefix`, `router`, `peer`, `bmp_raw`) |
-| bongsudae_other_afi_total | counter | | MP_REACH / MP_UNREACH of other address families (counted, dropped) |
-| bongsudae_other_family_total | counter | family | (0.3.0+) the same per address family (`bgp-ls`, `rt-constraint` ...) |
+| bongsudae_other_afi_total | counter | | routes of unknown shape sent only as NLRI hex to the other_family topic (0.4.0+; 0.3 counted and dropped them) |
+| bongsudae_other_family_total | counter | family | (0.3.0+) the same per address family (`99/9`, `bgp-ls` ...) |
 | bongsudae_kafka_fails_total | counter | | Kafka produce failures (absent with file input) |
 | bongsudae_kafka_last_ok_time_seconds | gauge | | Unix time of the last successful produce |
 | go_memstats_heap_alloc_bytes, go_memstats_sys_bytes, go_gc_cycles_total, go_goroutines | | | Go runtime (same names as the Prometheus Go client) |
 
 - Per-router values are computed per request (same as `/api/routers`). Global totals are sums of the one-minute statistics, so they grow once a minute.
 - After a restart or `-upgrade` the `_total` counters start from 0 (Prometheus `rate()` handles counter resets).
+- Grafana dashboard example (0.4.0~): `deploy/grafana/bongsudae.json`. Import it in Grafana (Dashboards -> New -> Import) and pick a Prometheus data source. Variables: Collector = Prometheus instance, Router = router address.
 - Alert examples: `bongsudae_router_up == 0`, `increase(bongsudae_router_errors_total[10m]) > 0`, `time() - bongsudae_kafka_last_ok_time_seconds > 120`
 
 ## 3. Peers
@@ -211,9 +212,9 @@ Peers of all routers (by router, then by peer address). Array. Query parameters 
 | peer_up | Whether a Peer Up was received in the current BMP session (if true, the route count is exact from the start) |
 | synced | Initial table transfer complete = an End-of-RIB was received for every unicast family (IPv4 / IPv6) negotiated by both OPENs. False without a Peer Up or without the OPENs |
 | view | (0.3.0+) The **view** that the route counts, synced, settled, eor, adds, dels and last_update above refer to: the peer's main view (the first view received, in the order below; normally `in-pre`, `loc-rib` for a Loc-RIB peer). Views: `in-pre` (Adj-RIB-In pre-policy, RFC 7854), `in-post` (post-policy), `out-pre` (Adj-RIB-Out pre-policy, RFC 8671), `out-post`, `loc-rib` (RFC 9069), taken from the L / O flags and the Peer Type of the per-peer header |
-| family_routes | (0.3.0+, omitted when none) number of routes per other address family with a route table, e.g. `{"vpnv4": 1200}` (only families listed in `bmp.rib`; none by default) |
+| family_routes | (0.3.0+, omitted when none) number of routes per other address family with a routing table, e.g. `{"vpnv4": 1200}` (only families listed in `bmp.rib`; none by default) |
 | paths_v4 / paths_v6 | (0.3.0+, only for sessions that negotiated Add-Path, RFC 7911) number of paths. With Add-Path a prefix can have several paths, so this can exceed `routes_v4` (the number of prefixes) |
-| views | (0.3.0+, only when the router sends the same neighbor in two or more views) one entry per view: `{"view", "routes_v4", "routes_v6", "paths_v4", "paths_v6", "synced", "settled", "eor_v4", "eor_v6", "last_update", "adds", "dels"}`. Each view has its own route table, so views never mix |
+| views | (0.3.0+, only when the router sends the same neighbor in two or more views) one entry per view: `{"view", "routes_v4", "routes_v6", "paths_v4", "paths_v6", "synced", "settled", "eor_v4", "eor_v6", "last_update", "adds", "dels"}`. Each view has its own routing table, so views never mix |
 | settled | `synced`, or the peer has been up for 5 minutes and no new prefix arrived for 5 minutes (changes and withdrawals do not count). For routers that do not forward End-of-RIB over BMP. Only up peers with a Peer Up. Right after `-upgrade`, peers up for more than 5 minutes are settled at once (the time of the last new prefix is not handed over) |
 | eor_v4 / eor_v6 | When End-of-RIB was received (omitted if not). Observed: 19 s (3,937 messages) and 225 s (5,525 messages) after Peer Up |
 | routes_v4 / routes_v6 | Number of prefixes currently alive |
@@ -248,7 +249,8 @@ One peer plus `"detail"`. 404 if the router or peer is unknown.
 - `pre_policy`, `adj_rib_in`, `as4`: from the per-peer header flags.
 - `sent_caps` = capabilities in the OPEN the router sent, `recv_caps` = capabilities in the OPEN the peer sent.
   Empty if no Peer Up was received (ports and hold times are then 0).
-- `families` / `add_path` (0.3.0+, omitted when empty): address families announced in both OPENs (`ipv4-unicast`, `ipv6-unicast`, `vpnv4`, `l2vpn-evpn` ...) and those received with Add-Path. Bongsudae parses ipv4 / ipv6-unicast, labeled unicast, vpnv4 / vpnv6, multicast and l2vpn-evpn (0.3.0); the others are counted and dropped (`other_families` in /api/stats)
+- (0.4.0~) `info_data` = Peer Up information TLV 0 (free text), `table_name` = TLV 3 (VRF / table name; optional per RFC 9069, `global` for the default table). Omitted when empty. Junos sends the Loc-RIB table name (`inet.0` / `inet6.0`) as TLV 0 = `info_data`.
+- `families` / `add_path` (0.3.0+, omitted when empty): address families announced in both OPENs (`ipv4-unicast`, `ipv6-unicast`, `vpnv4`, `l2vpn-evpn` ...) and those received with Add-Path. Bongsudae parses ipv4 / ipv6-unicast, labeled unicast, vpnv4 / vpnv6, multicast, l2vpn-evpn and FlowSpec (0.3.0), and from 0.4.0 every family (BGP-LS, VPLS, MVPN, SR Policy, RT Constraint, others as other_family: kafka.md 3.5)
 - `history`: the last 10 events, oldest first: `up (Peer Up)`, `seen in route monitoring (no Peer Up)`,
   `End-of-RIB IPv4 (routes N)`, `End-of-RIB IPv6 (routes N)`, `down : ...`.
 - `bmp_stats` / `bmp_stats_at` (0.2.0+, inside `detail`, omitted if none received): the last BMP Statistics Report (RFC 7854 4.8) the router sent for this peer. Names follow the IANA types (`rejected_prefixes`, `duplicate_prefix_advertisements`, `adj_rib_in_routes`, `loc_rib_routes`, `updates_treat_as_withdraw`, ...); per address family values get `_<afi>_<safi>` (e.g. `adj_rib_in_routes_1_1` = IPv4 unicast); unknown types are `type_N`. Only for known peers (a Stats Report never creates a peer).
@@ -283,6 +285,8 @@ routes (the peer's `recv_caps` should include `Route Refresh (2)`; check per pla
 issued on the router by your own tooling; the collector has no access to the routers.
 
 ## 4. Routes (prefixes)
+
+Route counts, lists and lookups in this section need the routing table of that address family to be on (config `bmp.rib`; **from 0.4.0 all are off by default**). Otherwise 409.
 
 One route row (JSON):
 
@@ -328,7 +332,7 @@ All routes of one peer / of one router (all its peers). **Can be very large** (a
 |---|---|
 | afi=4 / 6 | IPv4 / IPv6 only |
 | view= | (0.3.0+) View `in-pre` / `in-post` / `out-pre` / `out-post` / `loc-rib` (default: the peer's main view). A view never received gives an empty list. Invalid: 400 |
-| family= | (0.3.0+) Address family `vpnv4` / `vpnv6` / `ipv4-labeled` / `ipv6-labeled` / `ipv4-multicast` / `ipv6-multicast` / `ipv4-flowspec` / `ipv6-flowspec` / `vpnv4-flowspec` / `vpnv6-flowspec` (`ipv4-unicast` / `ipv6-unicast` = afi=4 / 6). 409 if that family's route table is off (bmp.rib), 400 for a family without route tables. Rows in (RD, prefix, path_id) order; L3VPN rows carry `rd`, labeled rows `labels` |
+| family= | (0.3.0+) Address family `vpnv4` / `vpnv6` / `ipv4-labeled` / `ipv6-labeled` / `ipv4-multicast` / `ipv6-multicast` / `ipv4-flowspec` / `ipv6-flowspec` / `vpnv4-flowspec` / `vpnv6-flowspec` (`ipv4-unicast` / `ipv6-unicast` = afi=4 / 6). 409 if that family's routing table is off (bmp.rib), 400 for a family without routing tables. Rows in (RD, prefix, path_id) order; L3VPN rows carry `rd`, labeled rows `labels` |
 | p= / match= | Filter by prefix / address, with the same meaning as in "Search" below (if p is a prefix the default match is exact, if an address it is longest; `longest` gives one row per peer). match without p is 400 |
 | origin_as=N[,N...] / not_origin=N[,N...] | Origin filter (see "Origin filter" below) |
 | path_as=N[,N...] | Rows whose as_path contains one of these ASes. ASes inside an AS_SET (`{a,b}`) and the origin are part of as_path and match. Rows with an empty as_path (iBGP) never match |
@@ -514,7 +518,7 @@ requests are refused with 403.
 | 400 | Invalid value (address, prefix, match, origin_as / not_origin, path_as, offset / limit, as / state of /api/peers, topic name, X-Actor, body, number of p entries), or a failed rules reload |
 | 403 | Wrong key / key file missing or too short. Client address outside `http.allow` |
 | 404 | Unknown router / peer, DELETE of a rule that does not exist, reset of a router that is not connected |
-| 409 | Route list / prefix lookup while route tables are all off (`-rib=none`, which is the 0.2 `-rib=false`; 0.2.0+. From 0.3.0 families can be switched off one by one: then the family is missing and the peer has a warning instead of a 409). The rules file was edited by hand and not yet reloaded -> reload first. Reset called when the input is not tcp |
+| 409 | Route list / prefix lookup while routing tables are all off (`-rib=none`, which is the 0.2 `-rib=false`; 0.2.0+. From 0.3.0 families can be switched off one by one: then the family is missing and the peer has a warning instead of a 409). The rules file was edited by hand and not yet reloaded -> reload first. Reset called when the input is not tcp |
 | 413 | Prefix search exceeded the row cap (2,000,000) -> add a limit, use a narrower prefix, or download a router's list |
 | 415 | POST /api/prefix without `Content-Type: application/json` |
 | 429 | Reset of the same router again within 10 minutes (see the Retry-After header) |

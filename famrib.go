@@ -1,4 +1,6 @@
-// famrib.go : unicast 밖 경로 종류의 경로표 (0.3.0 : labeled unicast, L3VPN, multicast. FlowSpec 표는 flowspec.go 의 fsTable)
+// SPDX-License-Identifier: Apache-2.0
+
+// famrib.go : unicast 밖 경로 종류의 라우팅 테이블 (0.3.0 : labeled unicast, L3VPN, multicast. FlowSpec 표는 flowspec.go 의 fsTable)
 //
 // 같은 ribTable[K] (ribtable.go) 를 쓰고 열쇠만 종류마다 : labeled / multicast = key4 / key6 (프리픽스),
 // L3VPN = keyVPN4 / keyVPN6 (RD + 프리픽스 : 같은 프리픽스도 RD 가 다르면 다른 경로). 라벨은 경로 속성에 (pathAttr.labels).
@@ -36,7 +38,7 @@ type famRow struct {
 	rule bool // FlowSpec : 속성의 labels 칸에 규칙 글자
 }
 
-// famTable : 종류 하나의 경로표 (종류마다 열쇠가 달라 interface : C 의 함수 포인터 표)
+// famTable : 종류 하나의 라우팅 테이블 (종류마다 열쇠가 달라 interface : C 의 함수 포인터 표)
 type famTable interface {
 	size() int  // 프리픽스 (RD + 프리픽스) 수
 	paths() int // 경로 수
@@ -55,7 +57,7 @@ type famTab[K ribKey] struct {
 	decKey func(d *dec) K
 }
 
-// newFamTable : 종류 f 의 빈 표 (경로표를 들 수 없는 종류면 nil)
+// newFamTable : 종류 f 의 빈 표 (라우팅 테이블을 들 수 없는 종류면 nil)
 func newFamTable(f family) famTable {
 	if _, ok := fsFams[f]; ok { // FlowSpec (flowspec.go)
 		return &fsTable{f: f}
@@ -193,7 +195,7 @@ func (rv *ribView) famFor(f family) famTable {
 	return t
 }
 
-// applyFams : UPDATE 의 경로 종류 묶음을 표에 (on = 경로표를 드는 종류, apFams = Add-Path 로 받는 종류)
+// applyFams : UPDATE 의 경로 종류 묶음을 표에 (on = 라우팅 테이블을 드는 종류, apFams = Add-Path 로 받는 종류)
 func (rv *ribView) applyFams(u *update, tm uint32, on map[family]bool, apFams []family) {
 	for i := range u.fams {
 		fu := &u.fams[i]
